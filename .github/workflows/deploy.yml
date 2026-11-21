@@ -65,10 +65,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure SSH
+      - name: Configure SSH (one multiplexed connection; the server rate-limits port 22)
         env:
           DO_SSH_KEY: ${{ secrets.DO_SSH_KEY }}
           DO_HOST: ${{ secrets.DO_HOST }}
+          DO_USER: ${{ secrets.DO_USER }}
           DO_KNOWN_HOSTS: ${{ secrets.DO_KNOWN_HOSTS }}
         run: |
           install -m 700 -d ~/.ssh
@@ -82,26 +83,38 @@ jobs:
           if [ -n "$DO_KNOWN_HOSTS" ]; then
             printf '%s\n' "$DO_KNOWN_HOSTS" > ~/.ssh/known_hosts
           else
-            ssh-keyscan -H "$DO_HOST" > ~/.ssh/known_hosts 2>/dev/null
+            ssh-keyscan -T 15 -t ed25519 "$DO_HOST" > ~/.ssh/known_hosts 2>/dev/null  # a single connection
           fi
+          cat > ~/.ssh/config <<CFG
+          Host droplet
+            HostName $DO_HOST
+            User $DO_USER
+            IdentityFile ~/.ssh/id_deploy
+            IdentitiesOnly yes
+            BatchMode yes
+            ConnectTimeout 20
+            ControlMaster auto
+            ControlPath ~/.ssh/cm-%C
+            ControlPersist 300
+          CFG
+          chmod 600 ~/.ssh/config
+          # open the shared connection once; rsync and the restart step reuse it
+          for i in 1 2 3; do
+            ssh -fN droplet && echo "connected" && exit 0
+            echo "connect attempt $i failed; waiting 35s for the server's rate limit window"; sleep 35
+          done
+          echo "::error::Cannot reach the server over SSH"; exit 1
 
       - name: Sync web_app (keeps .env, gallery/, audio/, voices/, studio.db on the server)
-        env:
-          DO_HOST: ${{ secrets.DO_HOST }}
-          DO_USER: ${{ secrets.DO_USER }}
         run: |
           rsync -az --delete \
             --exclude '.env' --exclude 'gallery/' --exclude 'studio.db*' \
             --exclude '__pycache__/' --exclude 'deploy/ngrok.yml' --exclude 'prompts.local.json' --exclude 'audio/' --exclude 'voices/' \
-            -e "ssh -i ~/.ssh/id_deploy -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15" \
-            web_app/ "$DO_USER@$DO_HOST:/opt/canvas-studio/web_app/"
+            -e ssh web_app/ droplet:/opt/canvas-studio/web_app/
 
       - name: Install deps and restart
-        env:
-          DO_HOST: ${{ secrets.DO_HOST }}
-          DO_USER: ${{ secrets.DO_USER }}
         run: |
-          ssh -i ~/.ssh/id_deploy -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 "$DO_USER@$DO_HOST" '
+          ssh droplet '
             set -e
             cd /opt/canvas-studio
             [ -x venv/bin/python ] || python3 -m venv venv
@@ -113,3 +126,7 @@ jobs:
             done
             echo "canvas-studio did not come up"; systemctl status canvas-studio --no-pager -n 20; exit 1
           '
+
+      - name: Close SSH connection
+        if: always()
+        run: ssh -O exit droplet 2>/dev/null || true
