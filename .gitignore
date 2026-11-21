@@ -13,3 +13,4 @@ web_app/deploy/ngrok.yml
 # local-only notes
 HANDOVER.md
 *.md
+prompts.local.json

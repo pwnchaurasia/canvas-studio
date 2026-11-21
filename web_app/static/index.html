@@ -72,6 +72,33 @@
   .lightbox img { max-width: 100%; max-height: 100%; }
   details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 14px; }
   .login { max-width: 360px; margin: 18vh auto 0; }
+  /* writer */
+  .wbar { display: flex; gap: 6px; align-items: center; margin-top: 14px; }
+  .wbar select { flex: 1; min-width: 0; }
+  .ctrls { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-top: 8px; }
+  @media (min-width: 640px) { .ctrls { grid-template-columns: repeat(5, 1fr); } }
+  .ctrls select { padding: 8px; font-size: 13px; }
+  .thread { display: flex; flex-direction: column; gap: 12px; margin-top: 14px; }
+  .m-user { align-self: flex-end; max-width: 88%; background: var(--panel2); border: 1px solid var(--line);
+    border-radius: 12px; padding: 10px 12px; white-space: pre-wrap; word-wrap: break-word; }
+  .m-ai { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; word-wrap: break-word; }
+  .m-ai h1, .m-ai h2, .m-ai h3 { font-size: 16px; margin: 14px 0 6px; color: var(--accent); }
+  .m-ai p { margin: 0 0 10px; } .m-ai ul, .m-ai ol { margin: 0 0 10px; padding-left: 20px; }
+  .m-ai blockquote { margin: 0 0 10px; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
+  .m-ai hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
+  .m-ai code { background: var(--panel2); padding: 1px 4px; border-radius: 4px; }
+  .m-acts { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+  .m-img { max-width: 360px; }
+  .m-img img { width: 100%; border-radius: 12px; display: block; cursor: zoom-in; }
+  .m-img .hint { margin-top: 4px; }
+  .composer { position: sticky; bottom: calc(60px + env(safe-area-inset-bottom)); background: var(--bg); padding: 10px 0 4px; margin-top: 10px; }
+  .composer textarea { min-height: 64px; max-height: 40vh; }
+  .typing::after { content: "▍"; animation: blink 1s infinite; color: var(--accent); }
+  @keyframes blink { 50% { opacity: 0; } }
+  .modal { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: flex; align-items: flex-end; justify-content: center; z-index: 20; }
+  .modal .card { width: 100%; max-width: 560px; max-height: 92vh; overflow: auto; margin: 0; border-radius: 16px 16px 0 0; }
+  @media (min-width: 640px) { .modal { align-items: center; } .modal .card { border-radius: 16px; } }
+  .badge { cursor: pointer; }
 </style>
 </head>
 <body>
@@ -160,29 +187,85 @@
       <div id="gallery" class="grid"></div>
     </div>
 
-    <!-- Chat -->
-    <div id="tab-chat" class="hidden">
-      <div class="hint" style="margin-top:14px">Story chat. History stays in this tab only and is cleared on reload.</div>
-      <div id="chatlog" class="chatlog"></div>
-      <div class="card">
-        <textarea id="chatIn" placeholder="Write a message…" style="min-height:70px"></textarea>
-        <div class="row" style="margin-top:8px">
-          <button id="chatClear" class="btn small" type="button">Clear</button>
-          <button id="chatSend" class="btn" type="button" style="font-weight:600">Send</button>
+    <!-- Writer -->
+    <div id="tab-writer" class="hidden">
+      <div class="wbar">
+        <select id="threadSel" aria-label="Script"></select>
+        <button id="newThread" class="btn small" type="button">+ New</button>
+        <button id="threadMenu" class="btn small" type="button" aria-label="More">⋯</button>
+      </div>
+      <div id="threadMenuBox" class="card hidden" style="padding:8px;display:flex;gap:6px;flex-wrap:wrap">
+        <button id="renameThread" class="btn small" type="button">Rename</button>
+        <a id="exportThread" class="btn small" href="#">Export .md</a>
+        <button id="deleteThread" class="btn small danger" type="button">Delete</button>
+      </div>
+      <div class="ctrls">
+        <select id="wFormat" aria-label="Format">
+          <option value="story">Story</option><option value="screenplay">Screenplay</option>
+          <option value="reel">Reel</option><option value="outline">Outline</option><option value="chat">Chat</option>
+        </select>
+        <select id="wLang" aria-label="Language">
+          <option value="en">English</option><option value="hi">Hindi</option>
+          <option value="hinglish">Hinglish</option><option value="bilingual">Bilingual</option>
+        </select>
+        <select id="wTone" aria-label="Mode">
+          <option value="standard">Standard</option><option value="uncut">Uncut</option>
+        </select>
+        <select id="wModel" aria-label="Model"></select>
+        <select id="wLength" aria-label="Length">
+          <option value="normal">Normal</option><option value="long">Detailed Long</option>
+        </select>
+      </div>
+      <details id="bibleBox">
+        <summary>Story &amp; Character Bible</summary>
+        <textarea id="bible" placeholder="Characters (name, age, look, personality), setting, relationships, rules that must never change…" style="margin-top:8px;min-height:110px"></textarea>
+        <div class="row" style="margin-top:6px"><span id="bibleMsg" class="hint" style="align-self:center"></span>
+          <button id="saveBible" class="btn small" type="button" style="flex:0 0 auto">Save</button></div>
+      </details>
+      <div id="thread" class="thread"></div>
+      <div id="wEmpty" class="hint" style="margin-top:18px">Start a script: describe the story, scene, or reel you want. Type <b>/img</b> followed by a description to render an image right here.</div>
+      <div class="composer">
+        <textarea id="wIn" placeholder="Write your direction… (/img to render an image)"></textarea>
+        <div class="row" style="margin-top:6px">
+          <span id="wMsg" class="hint" style="align-self:center"></span>
+          <button id="wStop" class="btn hidden" type="button" style="flex:0 0 auto">Stop</button>
+          <button id="wSend" class="btn" type="button" style="flex:0 0 auto;font-weight:650;background:var(--accent);color:var(--accent-ink);border-color:var(--accent)">Send</button>
         </div>
-        <div id="chatMsg" class="msg err"></div>
       </div>
     </div>
   </div>
 
   <nav>
-    <button data-tab="studio" class="on">Studio</button>
+    <button data-tab="writer" id="navWriter" class="hidden">Writer</button>
+    <button data-tab="studio" class="on">Image Studio</button>
     <button data-tab="gallery">Gallery</button>
-    <button data-tab="chat" id="navChat" class="hidden">Chat</button>
   </nav>
 </section>
 
 <div id="lightbox" class="lightbox hidden"><img alt=""></div>
+
+<!-- Visualize scene -->
+<div id="vizModal" class="modal hidden">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <b>Visualize Scene</b><button id="vizClose" class="btn small" type="button">Close</button>
+    </div>
+    <label for="vizPrompt">Image prompt (editable)</label>
+    <textarea id="vizPrompt" style="min-height:150px"></textarea>
+    <div id="vizInfo" class="hint"></div>
+    <label>Aspect</label>
+    <div class="seg" id="vizAspect">
+      <button data-v="9:16" class="on">9:16</button><button data-v="1:1">1:1</button>
+      <button data-v="16:9">16:9</button><button data-v="draft">Draft</button>
+    </div>
+    <label>Variations</label>
+    <div class="seg" id="vizCount"><button data-v="1" class="on">1</button><button data-v="2">2</button></div>
+    <label>Style Mode: <span id="vizStyleVal">0.00</span></label>
+    <input id="vizStyle" type="range" min="0" max="1" step="0.05" value="0">
+    <button id="vizRender" class="btn primary" type="button">Render into script</button>
+    <div id="vizMsg" class="msg"></div>
+  </div>
+</div>
 
 <script>
 const $ = (s) => document.querySelector(s);
@@ -208,9 +291,16 @@ function show(view) {
 
 function setUsage(u) {
   if (!u) return;
-  $("#usage").textContent = `GPU ${u.gpu_minutes_total} / ${u.gpu_minutes_cap} min`;
-  $("#usage").title = `You: ${u.gpu_minutes_user} min this month (estimated)`;
+  state.usage = u;
+  const cost = u.llm_cost_total ? ` · $${u.llm_cost_total.toFixed(2)}` : "";
+  $("#usage").textContent = `GPU ${u.gpu_minutes_total}/${u.gpu_minutes_cap}m${cost}`;
 }
+$("#usage").addEventListener("click", () => {
+  const u = state.usage; if (!u) return;
+  alert(`This month (estimated)\n\nGPU: ${u.gpu_minutes_total} of ${u.gpu_minutes_cap} min (you: ${u.gpu_minutes_user})\n` +
+        `Writer: $${(u.llm_cost_total || 0).toFixed(4)} · ${(u.llm_tokens_total || 0).toLocaleString()} tokens ` +
+        `(you: $${(u.llm_cost_user || 0).toFixed(4)})`);
+});
 
 function segment(id, onPick) {
   const el = $(id);
@@ -252,7 +342,7 @@ $("#logout").addEventListener("click", async () => {
 document.querySelector("nav").addEventListener("click", (e) => {
   const b = e.target.closest("button"); if (!b) return;
   document.querySelectorAll("nav button").forEach(x => x.classList.toggle("on", x === b));
-  ["studio", "gallery", "chat"].forEach(t => $("#tab-" + t).classList.toggle("hidden", t !== b.dataset.tab));
+  ["writer", "studio", "gallery"].forEach(t => $("#tab-" + t).classList.toggle("hidden", t !== b.dataset.tab));
   if (b.dataset.tab === "gallery") loadGallery();
 });
 
@@ -357,35 +447,280 @@ async function loadGallery() {
 
 $("#lightbox").addEventListener("click", () => $("#lightbox").classList.add("hidden"));
 
-// ---- chat
-function renderChat() {
-  const log = $("#chatlog"); log.innerHTML = "";
-  state.chat.forEach(m => {
-    const b = document.createElement("div"); b.className = "bubble " + m.role; b.textContent = m.content;
-    log.appendChild(b);
-  });
-  window.scrollTo({ top: document.body.scrollHeight });
+// ---- writer
+const W = { threads: [], models: [], tid: null, msgs: [], streaming: null, viz: { aspect: "9:16", count: 1 } };
+const CONTINUE = "Continue seamlessly from where you stopped with full detail.";
+
+function esc(t) { return t.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function inline(t) {
+  return t.replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/(^|\W)_([^_\n]+)_(?=\W|$)/g, "$1<em>$2</em>");
 }
-$("#chatSend").addEventListener("click", async () => {
-  const text = $("#chatIn").value.trim(); if (!text) return;
-  state.chat.push({ role: "user", content: text }); $("#chatIn").value = ""; renderChat();
-  const btn = $("#chatSend"); btn.disabled = true; $("#chatMsg").textContent = "";
+function md(src) {
+  const lines = esc(src).split("\n"); let html = "", list = null, para = [];
+  const flushP = () => { if (para.length) { html += "<p>" + para.map(inline).join("<br>") + "</p>"; para = []; } };
+  const flushL = () => { if (list) { html += `</${list}>`; list = null; } };
+  for (const raw of lines) {
+    const l = raw.trimEnd(); let m;
+    if (!l.trim()) { flushP(); flushL(); continue; }
+    if ((m = l.match(/^(#{1,4})\s+(.*)$/))) { flushP(); flushL(); const n = Math.min(m[1].length + 1, 3); html += `<h${n}>${inline(m[2])}</h${n}>`; continue; }
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(l.trim())) { flushP(); flushL(); html += "<hr>"; continue; }
+    if ((m = l.match(/^\s*[-*•]\s+(.*)$/))) { flushP(); if (list !== "ul") { flushL(); html += "<ul>"; list = "ul"; } html += `<li>${inline(m[1])}</li>`; continue; }
+    if ((m = l.match(/^\s*\d+[.)]\s+(.*)$/))) { flushP(); if (list !== "ol") { flushL(); html += "<ol>"; list = "ol"; } html += `<li>${inline(m[1])}</li>`; continue; }
+    if ((m = l.match(/^&gt;\s?(.*)$/))) { flushP(); flushL(); html += `<blockquote>${inline(m[1])}</blockquote>`; continue; }
+    flushL(); para.push(l);
+  }
+  flushP(); flushL(); return html;
+}
+
+function wMsg(t, err) { $("#wMsg").textContent = t || ""; $("#wMsg").style.color = err ? "var(--danger)" : ""; }
+function curThread() { return W.threads.find(t => t.id === W.tid); }
+
+async function wInit() {
+  const r = await api("/api/models");
+  W.models = r.models;
+  $("#wModel").innerHTML = "";
+  r.models.forEach(m => { const o = document.createElement("option"); o.value = m.id; o.textContent = m.label; $("#wModel").appendChild(o); });
+  $("#wModel").value = r.default;
+  try { $("#wLength").value = localStorage.getItem("wLength") || "normal"; } catch {}
+  await loadThreads();
+}
+
+async function loadThreads(select) {
+  W.threads = (await api("/api/threads")).threads;
+  const sel = $("#threadSel"); sel.innerHTML = "";
+  const blank = document.createElement("option"); blank.value = ""; blank.textContent = W.threads.length ? "— New script —" : "New script";
+  sel.appendChild(blank);
+  W.threads.forEach(t => { const o = document.createElement("option"); o.value = t.id; o.textContent = t.title || "Untitled"; sel.appendChild(o); });
+  let want = select !== undefined ? select : null;
+  if (want === null) { try { want = localStorage.getItem("wThread"); } catch {} }
+  if (want && !W.threads.some(t => t.id === want)) want = null;
+  await openThread(want || "");
+}
+
+async function openThread(id) {
+  W.tid = id || null; $("#threadSel").value = id || "";
+  try { localStorage.setItem("wThread", id || ""); } catch {}
+  $("#threadMenuBox").classList.add("hidden");
+  if (!id) { W.msgs = []; $("#bible").value = ""; renderThread(); return; }
+  const r = await api(`/api/threads/${id}/messages`);
+  W.msgs = r.messages;
+  const t = r.thread;
+  $("#wFormat").value = t.format_mode; $("#wLang").value = t.language; $("#wTone").value = t.tone_mode;
+  if (W.models.some(m => m.id === t.model_id)) $("#wModel").value = t.model_id;
+  $("#bible").value = t.story_bible || ""; $("#bibleMsg").textContent = "";
+  renderThread();
+}
+
+function threadSettings() {
+  return { format_mode: $("#wFormat").value, language: $("#wLang").value, tone_mode: $("#wTone").value,
+           model_id: $("#wModel").value, story_bible: $("#bible").value };
+}
+
+async function ensureThread() {
+  if (W.tid) return W.tid;
+  const t = await api("/api/threads", { method: "POST", body: threadSettings() });
+  W.tid = t.id; W.threads.unshift(t);
+  const o = document.createElement("option"); o.value = t.id; o.textContent = "Untitled";
+  $("#threadSel").insertBefore(o, $("#threadSel").children[1] || null); $("#threadSel").value = t.id;
+  try { localStorage.setItem("wThread", t.id); } catch {}
+  return t.id;
+}
+
+async function patchThread(fields) {
+  if (!W.tid) return;
+  try { await api(`/api/threads/${W.tid}`, { method: "PATCH", body: fields }); }
+  catch (e) { wMsg(e.message, true); await openThread(W.tid); }
+}
+["#wFormat", "#wLang", "#wTone", "#wModel"].forEach(id => $(id).addEventListener("change", () => {
+  const key = { "#wFormat": "format_mode", "#wLang": "language", "#wTone": "tone_mode", "#wModel": "model_id" }[id];
+  patchThread({ [key]: $(id).value });
+}));
+$("#wLength").addEventListener("change", () => { try { localStorage.setItem("wLength", $("#wLength").value); } catch {} });
+$("#saveBible").addEventListener("click", async () => {
   try {
-    const r = await api("/api/chat", { method: "POST", body: { messages: state.chat.slice(-60) } });
-    state.chat.push({ role: "assistant", content: r.reply }); renderChat();
-  } catch (err) { $("#chatMsg").textContent = err.message; state.chat.pop(); renderChat(); $("#chatIn").value = text; }
-  finally { btn.disabled = false; }
+    if (W.tid) await api(`/api/threads/${W.tid}`, { method: "PATCH", body: { story_bible: $("#bible").value } });
+    else await ensureThread();
+    $("#bibleMsg").textContent = "Saved";
+  } catch (e) { $("#bibleMsg").textContent = e.message; }
 });
-$("#chatClear").addEventListener("click", () => { state.chat = []; renderChat(); });
+$("#threadSel").addEventListener("change", () => openThread($("#threadSel").value));
+$("#newThread").addEventListener("click", () => openThread(""));
+$("#threadMenu").addEventListener("click", () => {
+  if (!W.tid) return;
+  $("#exportThread").href = `/api/threads/${W.tid}/export`;
+  $("#threadMenuBox").classList.toggle("hidden");
+});
+$("#renameThread").addEventListener("click", async () => {
+  const t = curThread(); const name = prompt("Rename script", t ? t.title : ""); if (name === null) return;
+  await patchThread({ title: name.slice(0, 120) }); await loadThreads(W.tid);
+});
+$("#deleteThread").addEventListener("click", async () => {
+  if (!W.tid || !confirm("Delete this script and its messages? Images stay in the Gallery.")) return;
+  await api(`/api/threads/${W.tid}`, { method: "DELETE" }); await loadThreads("");
+});
+
+function renderThread() {
+  const box = $("#thread"); box.innerHTML = "";
+  $("#wEmpty").classList.toggle("hidden", W.msgs.length > 0);
+  const lastAi = [...W.msgs].reverse().find(m => m.role === "assistant");
+  W.msgs.forEach(m => box.appendChild(msgEl(m, lastAi && m.id === lastAi.id)));
+}
+
+function msgEl(m, isLast) {
+  const d = document.createElement("div");
+  if (m.role === "user") { d.className = "m-user"; d.textContent = m.content; return d; }
+  if (m.role === "image") {
+    const c = m.content || {}; d.className = "m-img";
+    const img = document.createElement("img"); img.src = c.url; img.alt = ""; img.loading = "lazy";
+    img.onerror = () => { d.innerHTML = '<div class="hint">Image deleted from Gallery.</div>'; };
+    img.addEventListener("click", () => { $("#lightbox img").src = c.url; $("#lightbox").classList.remove("hidden"); });
+    const cap = document.createElement("div"); cap.className = "hint"; cap.textContent = `seed ${c.seed} · ${c.aspect || ""}`;
+    const acts = document.createElement("div"); acts.className = "m-acts";
+    acts.append(btn("Open in Studio", () => reuseSeed({ prompt: c.prompt, seed: c.seed, aspect: c.aspect, adapter_scale: c.adapter_scale })));
+    d.append(img, cap, acts); return d;
+  }
+  d.className = "m-ai";
+  const body = document.createElement("div"); body.innerHTML = md(m.content); d.appendChild(body);
+  if (m.id) {
+    const acts = document.createElement("div"); acts.className = "m-acts";
+    acts.append(
+      btn("Copy", async (b) => { try { await navigator.clipboard.writeText(m.content); b.textContent = "Copied"; } catch { b.textContent = "Copy failed"; } }),
+      btn("Visualize Scene", () => openViz(m.content)),
+    );
+    if (isLast) acts.append(btn("Continue", () => send(CONTINUE)), btn("Regenerate", () => send(null, true)));
+    d.appendChild(acts);
+  }
+  return d;
+}
+function btn(label, fn) {
+  const b = document.createElement("button"); b.type = "button"; b.className = "btn small"; b.textContent = label;
+  b.addEventListener("click", () => fn(b)); return b;
+}
+
+function setStreaming(on) {
+  $("#wSend").classList.toggle("hidden", on); $("#wStop").classList.toggle("hidden", !on);
+  $("#wIn").disabled = on;
+}
+
+async function send(text, regenerate = false) {
+  if (W.streaming) return;
+  text = (text ?? $("#wIn").value).trim();
+  if (!regenerate && !text) return;
+  if (!regenerate && /^\/img\b/i.test(text)) {
+    const p = text.replace(/^\/img\s*/i, "").trim();
+    if (!p) { wMsg("Add a description after /img", true); return; }
+    $("#wIn").value = ""; return renderInline({ prompt: p, aspect: "9:16", count: 1, adapter_scale: +$("#styleScale").value || 0 });
+  }
+  wMsg("");
+  let tid;
+  try { tid = await ensureThread(); } catch (e) { wMsg(e.message, true); return; }
+  if (regenerate) {
+    const idx = W.msgs.map(m => m.role).lastIndexOf("user");
+    W.msgs = W.msgs.filter((m, i) => i <= idx || m.role !== "assistant");
+  } else { W.msgs.push({ role: "user", content: text }); $("#wIn").value = ""; }
+  renderThread();
+  const live = { role: "assistant", content: "" };
+  const el = msgEl(live, false); el.firstChild.classList.add("typing"); $("#thread").appendChild(el);
+  $("#wEmpty").classList.add("hidden");
+  const ctrl = new AbortController(); W.streaming = ctrl; setStreaming(true);
+  let pending = false, failed = null;
+  const paint = () => { pending = false; el.firstChild.innerHTML = md(live.content); };
+  try {
+    const res = await fetch(`/api/threads/${tid}/stream`, {
+      method: "POST", credentials: "same-origin", signal: ctrl.signal,
+      headers: { "X-Requested-With": "canvas", "Content-Type": "application/json" },
+      body: JSON.stringify({ content: regenerate ? "" : text, regenerate, length: $("#wLength").value }),
+    });
+    if (!res.ok) { const j = await res.json().catch(() => ({})); throw new Error(typeof j.detail === "string" ? j.detail : `Error ${res.status}`); }
+    const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let k;
+      while ((k = buf.indexOf("\n\n")) >= 0) {
+        const chunk = buf.slice(0, k); buf = buf.slice(k + 2);
+        if (!chunk.startsWith("data: ")) continue;
+        const ev = JSON.parse(chunk.slice(6));
+        if (ev.type === "delta") { live.content += ev.t; if (!pending) { pending = true; requestAnimationFrame(paint); } }
+        else if (ev.type === "done") setUsage(ev.usage);
+        else if (ev.type === "error") failed = ev.detail;
+      }
+    }
+  } catch (e) { if (e.name !== "AbortError") failed = e.message; }
+  finally {
+    W.streaming = null; setStreaming(false);
+    if (failed) wMsg(failed, true);
+    await openThread(tid).catch(() => {});
+    loadThreadTitles();
+  }
+}
+async function loadThreadTitles() {
+  try {
+    W.threads = (await api("/api/threads")).threads;
+    [...$("#threadSel").options].forEach(o => { const t = W.threads.find(x => x.id === o.value); if (t) o.textContent = t.title || "Untitled"; });
+  } catch {}
+}
+$("#wSend").addEventListener("click", () => send());
+$("#wStop").addEventListener("click", () => W.streaming && W.streaming.abort());
+$("#wIn").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); } });
+
+// ---- visualize scene
+const setVizAspect = segment("#vizAspect", v => W.viz.aspect = v);
+const setVizCount = segment("#vizCount", v => W.viz.count = +v);
+$("#vizStyle").addEventListener("input", e => $("#vizStyleVal").textContent = (+e.target.value).toFixed(2));
+$("#vizClose").addEventListener("click", () => $("#vizModal").classList.add("hidden"));
+
+async function openViz(sceneText) {
+  if (!W.tid) return;
+  $("#vizModal").classList.remove("hidden");
+  $("#vizPrompt").value = ""; $("#vizMsg").textContent = ""; $("#vizRender").disabled = true;
+  $("#vizInfo").textContent = "Writing an image prompt from this scene…";
+  const custom = $("#wTone").value === "uncut";
+  try {
+    const r = await api(`/api/threads/${W.tid}/scene-prompt`, { method: "POST",
+      body: { scene_text: sceneText.slice(-12000), style_preset: custom ? "custom" : "standard" } });
+    $("#vizPrompt").value = r.visual_prompt;
+    $("#vizStyle").value = r.recommended_adapter_scale; $("#vizStyleVal").textContent = r.recommended_adapter_scale.toFixed(2);
+    $("#vizInfo").textContent = `${r.words} words · edit freely before rendering`;
+    $("#vizRender").disabled = false;
+  } catch (e) { $("#vizInfo").textContent = e.message; }
+}
+$("#vizRender").addEventListener("click", async () => {
+  const prompt = $("#vizPrompt").value.trim(); if (!prompt) return;
+  $("#vizModal").classList.add("hidden");
+  await renderInline({ prompt, aspect: W.viz.aspect, count: W.viz.count, adapter_scale: +$("#vizStyle").value });
+});
+
+async function renderInline(body) {
+  let tid;
+  try { tid = await ensureThread(); } catch (e) { wMsg(e.message, true); return; }
+  const t0 = Date.now(); setStreaming(true); $("#wSend").classList.add("hidden"); $("#wStop").classList.add("hidden");
+  const tick = () => wMsg(`Rendering image… ~60s if the GPU is asleep, ~20s per image when warm. ${Math.round((Date.now() - t0) / 1000)}s`);
+  tick(); const timer = setInterval(tick, 1000);
+  try {
+    const r = await api(`/api/threads/${tid}/render-inline`, { method: "POST", body });
+    setUsage(r.usage); wMsg(`Rendered in ${Math.round((Date.now() - t0) / 1000)}s · saved to Gallery`);
+    await openThread(tid);
+    window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+  } catch (e) { wMsg(e.message, true); }
+  finally { clearInterval(timer); setStreaming(false); }
+}
 
 // ---- boot
 async function boot() {
   try {
     const me = await api("/api/me");
     state.me = me;
-    $("#navChat").classList.toggle("hidden", !me.chat_enabled);
+    $("#navWriter").classList.toggle("hidden", !me.writer_enabled);
     setUsage(me.usage);
     show("app");
+    if (me.writer_enabled) {
+      document.querySelector('nav button[data-tab="writer"]').click();
+      wInit().catch(e => wMsg(e.message, true));
+    }
   } catch { show("login"); }
 }
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});

@@ -24,6 +24,7 @@ from itsdangerous import BadSignature, URLSafeTimedSerializer
 from pydantic import BaseModel, Field
 
 import prompt_tools
+import writer
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -54,8 +55,15 @@ class Settings:
         self.modal_proxy_secret = env("MODAL_PROXY_SECRET", "")
         self.llm_base_url = env("LLM_BASE_URL", "").rstrip("/")
         self.llm_api_key = env("LLM_API_KEY", "")
-        self.llm_model = env("LLM_MODEL", "")
-        self.enhancer_model = env("ENHANCER_MODEL", "") or self.llm_model
+        self.llm_models = parse_models(env("LLM_MODELS", ""))
+        legacy = env("LLM_MODEL", "")
+        self.llm_default_model = (
+            env("LLM_DEFAULT_MODEL", "") or legacy or (self.llm_models[0]["id"] if self.llm_models else "")
+        )
+        if self.llm_default_model and self.llm_default_model not in [m["id"] for m in self.llm_models]:
+            self.llm_models.insert(0, {"label": "Default", "id": self.llm_default_model})
+        self.enhancer_model = env("ENHANCER_MODEL", "") or self.llm_default_model
+        self.local_prompts_path = Path(env("WRITER_PROMPTS_FILE", str(BASE_DIR / "prompts.local.json")))
         self.cookie_secure = env("COOKIE_SECURE", "1") != "0"
         self.monthly_cap_min = float(env("MONTHLY_GPU_MINUTES_CAP", "1800"))
         self.data_dir = Path(env("DATA_DIR", str(BASE_DIR)))
@@ -67,7 +75,18 @@ class Settings:
 
     @property
     def llm_enabled(self) -> bool:
-        return bool(self.llm_base_url and self.llm_model)
+        return bool(self.llm_base_url and self.llm_default_model)
+
+
+def parse_models(raw: str) -> list[dict[str, str]]:
+    """'Label|model_id,Label 2|model_id_2' -> [{'label': ..., 'id': ...}]"""
+    out: list[dict[str, str]] = []
+    for item in filter(None, (p.strip() for p in raw.split(","))):
+        label, sep, model_id = item.partition("|")
+        model_id = (model_id if sep else label).strip()
+        if model_id and model_id not in [m["id"] for m in out]:
+            out.append({"label": (label if sep else model_id).strip(), "id": model_id})
+    return out
 
 
 def parse_users(raw: str) -> dict[str, str]:
@@ -181,21 +200,17 @@ class EnhanceBody(BaseModel):
     prompt: str = Field(min_length=1, max_length=2000)
 
 
-class ChatMessage(BaseModel):
-    role: str = Field(pattern=r"^(user|assistant)$")
-    content: str = Field(min_length=1, max_length=8000)
-
-
-class ChatBody(BaseModel):
-    messages: list[ChatMessage] = Field(min_length=1, max_length=60)
-
-
 # ---------------------------------------------------------------- app factory
 
 
-def create_app(settings: Settings | None = None, renderer: Renderer | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    renderer: Renderer | None = None,
+    llm_transport: httpx.AsyncBaseTransport | None = None,
+) -> FastAPI:
     settings = settings or Settings()
     store = Store(settings.data_dir)
+    wstore = writer.WriterStore(store.db_path)
     signer = URLSafeTimedSerializer(settings.session_secret, salt="canvas-session")
     login_attempts: dict[str, deque[float]] = defaultdict(deque)
     http = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0), follow_redirects=True)
@@ -220,11 +235,15 @@ def create_app(settings: Settings | None = None, renderer: Renderer | None = Non
         return r.json()
 
     render = renderer or modal_render
+    llm_http = httpx.AsyncClient(transport=llm_transport) if llm_transport else http
+    llm = writer.LLMClient(llm_http, settings.llm_base_url, settings.llm_api_key)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         yield
         await http.aclose()
+        if llm_http is not http:
+            await llm_http.aclose()
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.settings, app.state.store = settings, store
@@ -315,25 +334,30 @@ def create_app(settings: Settings | None = None, renderer: Renderer | None = Non
     # ------------------------------------------------ authed routes
 
     def usage(user: str) -> dict:
+        llm_user, llm_total = wstore.usage_this_month(user), wstore.usage_this_month()
         return {
             "gpu_minutes_user": round(store.gpu_seconds_this_month(user) / 60, 1),
             "gpu_minutes_total": round(store.gpu_seconds_this_month() / 60, 1),
             "gpu_minutes_cap": settings.monthly_cap_min,
+            "llm_tokens_user": llm_user["tokens"],
+            "llm_cost_user": llm_user["cost_usd"],
+            "llm_tokens_total": llm_total["tokens"],
+            "llm_cost_total": llm_total["cost_usd"],
         }
 
     @app.get("/api/me")
     def me(user: str = Depends(require_user)) -> dict:
-        return {"user": user, "chat_enabled": settings.llm_enabled, "llm_enhancer": settings.llm_enabled,
+        return {"user": user, "writer_enabled": settings.llm_enabled, "llm_enhancer": settings.llm_enabled,
                 "usage": usage(user)}
 
-    @app.post("/api/generate", dependencies=[Depends(same_origin)])
-    async def generate(body: GenerateBody, user: str = Depends(require_user)) -> dict:
-        if reason := prompt_tools.blocked_reason(body.prompt):
+    async def render_and_save(user: str, req: dict[str, Any]) -> dict:
+        """Run the GPU worker and persist results to the user's gallery. Shared by Studio and Writer."""
+        if reason := prompt_tools.blocked_reason(req["prompt"]):
             raise HTTPException(status_code=400, detail=reason)
         if store.gpu_seconds_this_month() / 60 >= settings.monthly_cap_min:
             raise HTTPException(status_code=429, detail="Monthly GPU budget reached")
 
-        result = await render(body.model_dump())
+        result = await render(req)
         images = result.get("images") or []
         if not images:
             raise HTTPException(status_code=502, detail="GPU worker returned no images")
@@ -348,8 +372,8 @@ def create_app(settings: Settings | None = None, renderer: Renderer | None = Non
             filename = f"{user}_{ts}_{seed}.webp"
             (store.gallery / filename).write_bytes(base64.b64decode(img["image_b64"]))
             store.add({
-                "user": user, "filename": filename, "prompt": body.prompt, "seed": seed,
-                "aspect": body.aspect, "steps": body.steps, "adapter_scale": body.adapter_scale,
+                "user": user, "filename": filename, "prompt": req["prompt"], "seed": seed,
+                "aspect": req["aspect"], "steps": req["steps"], "adapter_scale": req["adapter_scale"],
                 "created_at": now.isoformat(), "estimated_gpu_sec": per_image,
             })
             saved.append({"filename": filename, "url": f"/api/image/{filename}", "seed": seed})
@@ -362,6 +386,10 @@ def create_app(settings: Settings | None = None, renderer: Renderer | None = Non
             "usage": usage(user),
         }
 
+    @app.post("/api/generate", dependencies=[Depends(same_origin)])
+    async def generate(body: GenerateBody, user: str = Depends(require_user)) -> dict:
+        return await render_and_save(user, body.model_dump())
+
     @app.post("/api/enhance-prompt", dependencies=[Depends(same_origin)])
     async def enhance(body: EnhanceBody, user: str = Depends(require_user)) -> dict:
         if reason := prompt_tools.blocked_reason(body.prompt):
@@ -371,11 +399,12 @@ def create_app(settings: Settings | None = None, renderer: Renderer | None = Non
         text = rule_text
         if settings.llm_enabled:
             try:
-                llm_text = await llm_complete(
+                llm_text, usage_info = await llm.complete(
                     [{"role": "system", "content": prompt_tools.ENHANCER_SYSTEM_PROMPT},
                      {"role": "user", "content": body.prompt}],
                     model=settings.enhancer_model, temperature=0.4, max_tokens=400,
                 )
+                wstore.log_usage(user, "enhance", settings.enhancer_model, usage_info, body.prompt, llm_text)
                 cleaned, more = prompt_tools.strip_negations(prompt_tools.scrub_terms(llm_text.strip().strip('"')))
                 if len(cleaned.split()) >= 30 and not prompt_tools.blocked_reason(cleaned):
                     text, source = cleaned, "llm"
@@ -409,33 +438,10 @@ def create_app(settings: Settings | None = None, renderer: Renderer | None = Non
         store.delete(user, filename)
         return {"ok": True}
 
-    # ------------------------------------------------ chat
-
-    async def llm_complete(messages: list[dict], model: str, temperature: float, max_tokens: int) -> str:
-        if not settings.llm_enabled:
-            raise HTTPException(status_code=503, detail="chat not configured")
-        headers = {"Authorization": f"Bearer {settings.llm_api_key}"} if settings.llm_api_key else {}
-        try:
-            r = await http.post(
-                f"{settings.llm_base_url}/chat/completions",
-                json={"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens},
-                headers=headers, timeout=120.0,
-            )
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"] or ""
-        except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
-            raise HTTPException(status_code=502, detail=f"chat backend error: {type(e).__name__}") from e
-
-    CHAT_SYSTEM = (
-        "You are a creative collaborator for interactive fiction. Stay in the user's chosen style and tone. "
-        "All characters are adults."
-    )
-
-    @app.post("/api/chat", dependencies=[Depends(same_origin)])
-    async def chat(body: ChatBody, user: str = Depends(require_user)) -> dict:
-        msgs = [{"role": "system", "content": CHAT_SYSTEM}] + [m.model_dump() for m in body.messages]
-        reply = await llm_complete(msgs, model=settings.llm_model, temperature=0.9, max_tokens=1200)
-        return {"reply": reply}
+    app.include_router(writer.build_router(
+        settings=settings, wstore=wstore, llm=llm, require_user=require_user, same_origin=same_origin,
+        render_and_save=render_and_save, usage=usage, local_prompts_path=settings.local_prompts_path,
+    ))
 
     return app
 

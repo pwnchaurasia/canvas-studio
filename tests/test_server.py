@@ -145,8 +145,9 @@ def test_docs_disabled_and_robots(make_client):
     assert 'name="robots" content="noindex, nofollow"' in c.get("/").text
 
 
-def test_chat_disabled_without_llm(make_client):
+def test_writer_disabled_without_llm(make_client):
     c = make_client("alice", "pw-a")
-    assert c.get("/api/me").json()["chat_enabled"] is False
-    r = c.post("/api/chat", json={"messages": [{"role": "user", "content": "hi"}]}, headers=HEADERS)
+    assert c.get("/api/me").json()["writer_enabled"] is False
+    t = c.post("/api/threads", json={}, headers=HEADERS).json()
+    r = c.post(f"/api/threads/{t['id']}/stream", json={"content": "hi"}, headers=HEADERS)
     assert r.status_code == 503
