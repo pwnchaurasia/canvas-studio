@@ -1,0 +1,10 @@
+# Copy to /etc/ngrok.yml (chmod 600), fill in, then:
+#   sudo ngrok service install --config /etc/ngrok.yml && sudo ngrok service start
+version: 3
+agent:
+  authtoken: <YOUR_NGROK_AUTHTOKEN>
+endpoints:
+  - name: canvas
+    url: https://<your-static-name>.ngrok-free.dev
+    upstream:
+      url: http://127.0.0.1:8090

@@ -1,0 +1,23 @@
+[Unit]
+Description=Canvas Studio web app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=canvas
+Group=canvas
+WorkingDirectory=/opt/canvas-studio/web_app
+EnvironmentFile=/opt/canvas-studio/web_app/.env
+ExecStart=/opt/canvas-studio/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8090 --workers 1 --no-access-log --proxy-headers --forwarded-allow-ips 127.0.0.1
+Restart=on-failure
+RestartSec=3
+MemoryMax=160M
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/canvas-studio/web_app
+
+[Install]
+WantedBy=multi-user.target

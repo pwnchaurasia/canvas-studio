@@ -1,0 +1,15 @@
+.env
+*.env
+!.env.example
+gallery/
+*.db
+*.db-journal
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+web_app/deploy/ngrok.yml
+
+# local-only notes
+HANDOVER.md
+*.md

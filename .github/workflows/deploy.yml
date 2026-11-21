@@ -1,0 +1,108 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: web_app/requirements.txt
+      - run: pip install -r web_app/requirements.txt pytest
+      - run: pytest -q
+
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      gpu: ${{ steps.filter.outputs.gpu }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            gpu:
+              - 'gpu_worker/**'
+            web:
+              - 'web_app/**'
+
+  deploy-gpu:
+    needs: [test, changes]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.gpu == 'true'
+    runs-on: ubuntu-latest
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install modal
+      # Builds the container image on Modal's side; model weights are never downloaded here.
+      - run: modal deploy gpu_worker/modal_worker.py
+
+  deploy-droplet:
+    needs: [test, changes]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          DO_SSH_KEY: ${{ secrets.DO_SSH_KEY }}
+          DO_HOST: ${{ secrets.DO_HOST }}
+          DO_KNOWN_HOSTS: ${{ secrets.DO_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DO_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          if [ -n "$DO_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$DO_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "$DO_HOST" > ~/.ssh/known_hosts 2>/dev/null
+          fi
+
+      - name: Sync web_app (keeps .env, gallery/, studio.db on the server)
+        env:
+          DO_HOST: ${{ secrets.DO_HOST }}
+          DO_USER: ${{ secrets.DO_USER }}
+        run: |
+          rsync -az --delete \
+            --exclude '.env' --exclude 'gallery/' --exclude 'studio.db*' \
+            --exclude '__pycache__/' --exclude 'deploy/ngrok.yml' \
+            -e "ssh -i ~/.ssh/id_deploy" \
+            web_app/ "$DO_USER@$DO_HOST:/opt/canvas-studio/web_app/"
+
+      - name: Install deps and restart
+        env:
+          DO_HOST: ${{ secrets.DO_HOST }}
+          DO_USER: ${{ secrets.DO_USER }}
+        run: |
+          ssh -i ~/.ssh/id_deploy "$DO_USER@$DO_HOST" '
+            set -e
+            cd /opt/canvas-studio
+            [ -x venv/bin/python ] || python3 -m venv venv
+            venv/bin/pip install -q --disable-pip-version-check -r web_app/requirements.txt
+            sudo systemctl restart canvas-studio
+            sleep 2
+            systemctl is-active --quiet canvas-studio
+            curl -fsS http://127.0.0.1:8090/robots.txt > /dev/null
+            echo "canvas-studio is up"
+          '
