@@ -287,7 +287,7 @@ $("#generate").addEventListener("click", async () => {
   $("#progress").classList.remove("hidden");
   const tick = () => {
     const s = Math.round((Date.now() - t0) / 1000);
-    $("#progressText").textContent = `Waking GPU worker (~25s first run, ~5s warm)… ${s}s`;
+    $("#progressText").textContent = `Rendering… ~60s if the GPU is asleep, then ~20s per image (Draft is faster). ${s}s`;
   };
   tick(); timer = setInterval(tick, 1000);
   try {

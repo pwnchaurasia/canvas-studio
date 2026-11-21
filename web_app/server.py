@@ -211,7 +211,12 @@ def create_app(settings: Settings | None = None, renderer: Renderer | None = Non
         except httpx.HTTPError as e:
             raise HTTPException(status_code=502, detail=f"GPU worker unreachable: {type(e).__name__}") from e
         if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"GPU worker error {r.status_code}")
+            try:
+                detail = r.json().get("detail")
+            except ValueError:
+                detail = None
+            msg = detail if isinstance(detail, str) else f"GPU worker error {r.status_code}"
+            raise HTTPException(status_code=502, detail=msg)
         return r.json()
 
     render = renderer or modal_render

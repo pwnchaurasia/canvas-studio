@@ -45,7 +45,11 @@ image = (
         "fastapi[standard]",
         "git+https://github.com/huggingface/diffusers",
     )
-    .env({"HF_HOME": CACHE_DIR, "HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .env({
+        "HF_HOME": CACHE_DIR,
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    })
 )
 
 weights = modal.Volume.from_name("canvas-studio-hf-cache", create_if_missing=True)
@@ -88,7 +92,20 @@ class Worker:
         from diffusers import ZImagePipeline
 
         t0 = time.perf_counter()
-        self.pipe = ZImagePipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16).to("cuda")
+        # Transformer (~12 GB) + VAE live on the GPU. The text encoder (~8 GB) stays in host RAM and is
+        # moved to the GPU only to encode the prompt; keeping all three resident leaves too little VRAM
+        # on the 22 GB L4 to decode anything larger than the draft size.
+        self.pipe = ZImagePipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
+        self.pipe.transformer.to("cuda")
+        self.pipe.vae.to("cuda")
+        # Pin the text encoder's host copy once; per-request swaps then just repoint tensors
+        # (GPU copy from pinned RAM is ~10x faster, and moving back is free).
+        te = self.pipe.text_encoder.to("cpu")
+        self._te_tensors = list(te.named_parameters()) + list(te.named_buffers())
+        self._te_pinned = {}
+        for name, t in self._te_tensors:
+            t.data = t.data.pin_memory()
+            self._te_pinned[name] = t.data
         if hasattr(self.pipe, "vae") and hasattr(self.pipe.vae, "enable_slicing"):
             self.pipe.vae.enable_slicing()
 
@@ -109,23 +126,49 @@ class Worker:
             pass
         self.load_s = round(time.perf_counter() - t0, 2)
         self.cold = True
-        print(f"Pipeline ready in {self.load_s}s")
+        print(
+            f"Pipeline ready in {self.load_s}s | execution device={self.pipe._execution_device} | "
+            f"VRAM used {torch.cuda.memory_allocated() / 2**30:.1f} GiB"
+        )
+
+    def _encode(self, prompt: str):
+        import torch
+
+        for name, t in self._te_tensors:
+            t.data = self._te_pinned[name].to("cuda", non_blocking=True)
+        torch.cuda.synchronize()
+        try:
+            with torch.no_grad():
+                embeds, _ = self.pipe.encode_prompt(
+                    prompt=prompt, device=torch.device("cuda"), do_classifier_free_guidance=False
+                )
+        finally:
+            for name, t in self._te_tensors:
+                t.data = self._te_pinned[name]
+            torch.cuda.empty_cache()
+        return embeds
 
     def _render(self, prompt: str, aspect: str, steps: int, count: int, seed: int | None, adapter_scale: float) -> dict:
         import torch
 
         width, height = PRESETS[aspect]
         if self.adapter_loaded:
-            self.pipe.set_adapters(["custom"], adapter_weights=[adapter_scale])
+            if adapter_scale > 0:
+                self.pipe.enable_lora()
+                self.pipe.set_adapters(["custom"], adapter_weights=[adapter_scale])
+            else:
+                self.pipe.disable_lora()  # skips adapter compute entirely
 
         base_seed = seed if seed is not None else random.randint(0, 2**31 - 1)
         seeds = [(base_seed + i) % 2**32 for i in range(count)]
 
         t0 = time.perf_counter()
+        embeds = self._encode(prompt)  # once per request, shared by every variation
+        encode_s = time.perf_counter() - t0
         images = []
-        for s in seeds:  # sequential keeps peak VRAM flat on the 24 GB L4
+        for s in seeds:  # sequential keeps peak VRAM flat on the L4
             result = self.pipe(
-                prompt=prompt,
+                prompt_embeds=embeds,
                 width=width,
                 height=height,
                 num_inference_steps=steps,
@@ -138,7 +181,11 @@ class Worker:
         gen_s = round(time.perf_counter() - t0, 2)
 
         cold, self.cold = self.cold, False
-        print(f"Generated {count} x {width}x{height} @ {steps} steps in {gen_s}s (cold={cold})")
+        print(
+            f"Generated {count} x {width}x{height} @ {steps} steps in {gen_s}s "
+            f"(encode {encode_s:.1f}s, peak VRAM {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB, cold={cold})"
+        )
+        torch.cuda.reset_peak_memory_stats()
         return {
             "images": images,
             "width": width,
@@ -171,6 +218,12 @@ class Worker:
                 raise HTTPException(status_code=401, detail="unauthorized")
             if req.aspect not in PRESETS:
                 raise HTTPException(status_code=422, detail=f"aspect must be one of {sorted(PRESETS)}")
-            return self._render(req.prompt, req.aspect, req.steps, req.count, req.seed, req.adapter_scale)
+            import torch
+
+            try:
+                return self._render(req.prompt, req.aspect, req.steps, req.count, req.seed, req.adapter_scale)
+            except torch.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                raise HTTPException(status_code=507, detail="GPU out of memory: try fewer variations or Draft size")
 
         return api
