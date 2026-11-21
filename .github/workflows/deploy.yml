@@ -71,8 +71,13 @@ jobs:
           DO_KNOWN_HOSTS: ${{ secrets.DO_KNOWN_HOSTS }}
         run: |
           install -m 700 -d ~/.ssh
-          printf '%s\n' "$DO_SSH_KEY" > ~/.ssh/id_deploy
+          printf '%s\n' "$DO_SSH_KEY" | tr -d '\r' > ~/.ssh/id_deploy
           chmod 600 ~/.ssh/id_deploy
+          if ! ssh-keygen -y -f ~/.ssh/id_deploy > /dev/null 2>&1; then
+            echo "::error::DO_SSH_KEY is not a valid private key. Paste the full output of: cat ~/.ssh/canvas_deploy (including the BEGIN/END lines), not the .pub file."
+            exit 1
+          fi
+          echo "Deploy key fingerprint: $(ssh-keygen -lf ~/.ssh/id_deploy | cut -d' ' -f2)"
           if [ -n "$DO_KNOWN_HOSTS" ]; then
             printf '%s\n' "$DO_KNOWN_HOSTS" > ~/.ssh/known_hosts
           else
@@ -87,7 +92,7 @@ jobs:
           rsync -az --delete \
             --exclude '.env' --exclude 'gallery/' --exclude 'studio.db*' \
             --exclude '__pycache__/' --exclude 'deploy/ngrok.yml' \
-            -e "ssh -i ~/.ssh/id_deploy" \
+            -e "ssh -i ~/.ssh/id_deploy -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15" \
             web_app/ "$DO_USER@$DO_HOST:/opt/canvas-studio/web_app/"
 
       - name: Install deps and restart
@@ -95,7 +100,7 @@ jobs:
           DO_HOST: ${{ secrets.DO_HOST }}
           DO_USER: ${{ secrets.DO_USER }}
         run: |
-          ssh -i ~/.ssh/id_deploy "$DO_USER@$DO_HOST" '
+          ssh -i ~/.ssh/id_deploy -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 "$DO_USER@$DO_HOST" '
             set -e
             cd /opt/canvas-studio
             [ -x venv/bin/python ] || python3 -m venv venv
