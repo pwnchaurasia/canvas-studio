@@ -43,7 +43,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("COOKIE_SECURE", "0")
     monkeypatch.setenv("MONTHLY_GPU_MINUTES_CAP", "1800")
-    for k in ("LLM_BASE_URL", "LLM_MODEL", "MODAL_ENDPOINT_URL"):
+    for k in ("LLM_BASE_URL", "LLM_MODEL", "LLM_MODELS", "LLM_DEFAULT_MODEL", "MODAL_ENDPOINT_URL", "MODAL_TTS_URL"):
         monkeypatch.delenv(k, raising=False)
     return tmp_path
 

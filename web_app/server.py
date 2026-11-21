@@ -24,6 +24,7 @@ from itsdangerous import BadSignature, URLSafeTimedSerializer
 from pydantic import BaseModel, Field
 
 import prompt_tools
+import voice
 import writer
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -50,6 +51,7 @@ class Settings:
         self.session_secret = env("SESSION_SECRET", "")
         self.users = parse_users(env("ALLOWED_USERS", ""))
         self.modal_url = env("MODAL_ENDPOINT_URL", "").rstrip("/")
+        self.modal_tts_url = env("MODAL_TTS_URL", "").rstrip("/")
         self.studio_api_key = env("STUDIO_API_KEY", "")
         self.modal_proxy_key = env("MODAL_PROXY_KEY", "")
         self.modal_proxy_secret = env("MODAL_PROXY_SECRET", "")
@@ -207,10 +209,12 @@ def create_app(
     settings: Settings | None = None,
     renderer: Renderer | None = None,
     llm_transport: httpx.AsyncBaseTransport | None = None,
+    tts_transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     store = Store(settings.data_dir)
     wstore = writer.WriterStore(store.db_path)
+    vstore = voice.VoiceStore(store.db_path)
     signer = URLSafeTimedSerializer(settings.session_secret, salt="canvas-session")
     login_attempts: dict[str, deque[float]] = defaultdict(deque)
     http = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0), follow_redirects=True)
@@ -236,14 +240,15 @@ def create_app(
 
     render = renderer or modal_render
     llm_http = httpx.AsyncClient(transport=llm_transport) if llm_transport else http
+    tts_http = httpx.AsyncClient(transport=tts_transport, follow_redirects=True) if tts_transport else http
     llm = writer.LLMClient(llm_http, settings.llm_base_url, settings.llm_api_key)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         yield
         await http.aclose()
-        if llm_http is not http:
-            await llm_http.aclose()
+        for extra in {llm_http, tts_http} - {http}:
+            await extra.aclose()
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.settings, app.state.store = settings, store
@@ -333,11 +338,18 @@ def create_app(
 
     # ------------------------------------------------ authed routes
 
+    def gpu_seconds(user: str | None = None) -> float:
+        """Image (L4) seconds + voice (T4) seconds converted to L4 cost-equivalent."""
+        return store.gpu_seconds_this_month(user) + vstore.tts_gpu_seconds_this_month(user)
+
+    def budget_left() -> bool:
+        return gpu_seconds() / 60 < settings.monthly_cap_min
+
     def usage(user: str) -> dict:
         llm_user, llm_total = wstore.usage_this_month(user), wstore.usage_this_month()
         return {
-            "gpu_minutes_user": round(store.gpu_seconds_this_month(user) / 60, 1),
-            "gpu_minutes_total": round(store.gpu_seconds_this_month() / 60, 1),
+            "gpu_minutes_user": round(gpu_seconds(user) / 60, 1),
+            "gpu_minutes_total": round(gpu_seconds() / 60, 1),
             "gpu_minutes_cap": settings.monthly_cap_min,
             "llm_tokens_user": llm_user["tokens"],
             "llm_cost_user": llm_user["cost_usd"],
@@ -348,13 +360,13 @@ def create_app(
     @app.get("/api/me")
     def me(user: str = Depends(require_user)) -> dict:
         return {"user": user, "writer_enabled": settings.llm_enabled, "llm_enhancer": settings.llm_enabled,
-                "usage": usage(user)}
+                "voice_enabled": bool(settings.modal_tts_url), "usage": usage(user)}
 
     async def render_and_save(user: str, req: dict[str, Any]) -> dict:
         """Run the GPU worker and persist results to the user's gallery. Shared by Studio and Writer."""
         if reason := prompt_tools.blocked_reason(req["prompt"]):
             raise HTTPException(status_code=400, detail=reason)
-        if store.gpu_seconds_this_month() / 60 >= settings.monthly_cap_min:
+        if not budget_left():
             raise HTTPException(status_code=429, detail="Monthly GPU budget reached")
 
         result = await render(req)
@@ -441,6 +453,10 @@ def create_app(
     app.include_router(writer.build_router(
         settings=settings, wstore=wstore, llm=llm, require_user=require_user, same_origin=same_origin,
         render_and_save=render_and_save, usage=usage, local_prompts_path=settings.local_prompts_path,
+    ))
+    app.include_router(voice.build_router(
+        settings=settings, vstore=vstore, wstore=wstore, llm=llm, http=tts_http, require_user=require_user,
+        same_origin=same_origin, usage=usage, budget_left=budget_left, data_dir=settings.data_dir,
     ))
 
     return app

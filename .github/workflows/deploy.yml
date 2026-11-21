@@ -56,6 +56,7 @@ jobs:
       - run: pip install modal
       # Builds the container image on Modal's side; model weights are never downloaded here.
       - run: modal deploy gpu_worker/modal_worker.py
+      - run: modal deploy gpu_worker/tts_worker.py
 
   deploy-droplet:
     needs: [test, changes]
@@ -84,14 +85,14 @@ jobs:
             ssh-keyscan -H "$DO_HOST" > ~/.ssh/known_hosts 2>/dev/null
           fi
 
-      - name: Sync web_app (keeps .env, gallery/, studio.db on the server)
+      - name: Sync web_app (keeps .env, gallery/, audio/, voices/, studio.db on the server)
         env:
           DO_HOST: ${{ secrets.DO_HOST }}
           DO_USER: ${{ secrets.DO_USER }}
         run: |
           rsync -az --delete \
             --exclude '.env' --exclude 'gallery/' --exclude 'studio.db*' \
-            --exclude '__pycache__/' --exclude 'deploy/ngrok.yml' --exclude 'prompts.local.json' \
+            --exclude '__pycache__/' --exclude 'deploy/ngrok.yml' --exclude 'prompts.local.json' --exclude 'audio/' --exclude 'voices/' \
             -e "ssh -i ~/.ssh/id_deploy -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15" \
             web_app/ "$DO_USER@$DO_HOST:/opt/canvas-studio/web_app/"
 

@@ -99,6 +99,16 @@
   .modal .card { width: 100%; max-width: 560px; max-height: 92vh; overflow: auto; margin: 0; border-radius: 16px 16px 0 0; }
   @media (min-width: 640px) { .modal { align-items: center; } .modal .card { border-radius: 16px; } }
   .badge { cursor: pointer; }
+  .players { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+  .player { display: flex; gap: 6px; align-items: center; }
+  .player audio { flex: 1; min-width: 0; height: 36px; }
+  .turn { display: flex; gap: 6px; align-items: flex-start; margin-top: 6px; }
+  .turn select { width: 92px; flex: 0 0 auto; padding: 6px; font-size: 13px; }
+  .turn textarea { min-height: 44px; padding: 6px 8px; font-size: 14px; }
+  .vrow { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 6px; background: var(--panel2); border: 1px solid var(--line); color: var(--muted); margin-left: 4px; }
+  .check { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--muted); margin-top: 10px; }
+  .check input { margin-top: 3px; }
 </style>
 </head>
 <body>
@@ -187,6 +197,43 @@
       <div id="gallery" class="grid"></div>
     </div>
 
+    <!-- Voice -->
+    <div id="tab-voice" class="hidden">
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <b>Narrate text</b><button id="openNarrate" class="btn small" type="button">Open narrator</button>
+        </div>
+        <div class="hint">Paste English, Hindi or Hinglish and turn it into an MP3 with one voice or a 2–3 voice scene.</div>
+      </div>
+      <div class="card">
+        <b>Voice Bank</b>
+        <div id="voiceList" style="margin-top:6px"></div>
+        <details style="margin-top:6px">
+          <summary>Add a voice</summary>
+          <form id="voiceForm">
+            <label for="vFile">Reference clip (.wav .mp3 .m4a, 5–15 s of clean speech, max 5 MB)</label>
+            <input id="vFile" type="file" accept=".wav,.mp3,.m4a,audio/*" required>
+            <div class="row">
+              <div><label for="vName">Name</label><input id="vName" type="text" maxlength="40" required></div>
+              <div><label for="vGender">Group</label><select id="vGender"><option value="male">Male</option><option value="female">Female</option></select></div>
+            </div>
+            <div class="row">
+              <div><label for="vLang">Clip language</label><select id="vLang"><option value="en">English</option><option value="hi">Hindi</option></select></div>
+              <div><label for="vPreset">Default delivery</label><select id="vPreset"><option value="natural">Natural</option><option value="slow_deep">Slow &amp; Deep</option><option value="expressive">Expressive</option></select></div>
+            </div>
+            <label class="check"><input id="vConsent" type="checkbox" required>
+              <span>This is my own voice, or I have the speaker's permission (or a license) to use it.</span></label>
+            <button class="btn primary" type="submit">Upload voice</button>
+            <div id="vMsg" class="msg"></div>
+          </form>
+        </details>
+      </div>
+      <div class="card">
+        <b>Saved audio</b>
+        <div id="audioLib" style="margin-top:6px"></div>
+      </div>
+    </div>
+
     <!-- Writer -->
     <div id="tab-writer" class="hidden">
       <div class="wbar">
@@ -238,11 +285,60 @@
   <nav>
     <button data-tab="writer" id="navWriter" class="hidden">Writer</button>
     <button data-tab="studio" class="on">Image Studio</button>
+    <button data-tab="voice" id="navVoice" class="hidden">Voice</button>
     <button data-tab="gallery">Gallery</button>
   </nav>
 </section>
 
 <div id="lightbox" class="lightbox hidden"><img alt=""></div>
+
+<!-- Listen -->
+<div id="listenModal" class="modal hidden">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <b>Listen</b><button id="lClose" class="btn small" type="button">Close</button>
+    </div>
+    <div class="seg" id="lMode" style="margin-top:10px">
+      <button data-v="single" class="on">Single Voice</button><button data-v="dialogue">Scene Dialogue (2–3 voices)</button>
+    </div>
+    <div class="row">
+      <div><label for="lLang">Language</label>
+        <select id="lLang"><option value="en">English</option><option value="hi">Hindi</option></select></div>
+    </div>
+    <label class="check hidden" id="lHinglishRow"><input id="lHinglish" type="checkbox" checked>
+      <span>Convert Roman Hinglish to Hindi script</span></label>
+
+    <div id="lSingle">
+      <label for="lVoice">Voice</label><select id="lVoice"></select>
+      <label>Delivery</label>
+      <div class="seg" id="lPreset">
+        <button data-v="natural" class="on">Natural</button><button data-v="slow_deep">Slow &amp; Deep</button><button data-v="expressive">Expressive</button>
+      </div>
+      <details><summary>Fine-tune</summary>
+        <label>Exaggeration: <span id="lExgVal">0.50</span></label><input id="lExg" type="range" min="0.25" max="1.2" step="0.05" value="0.5">
+        <label>Pace / CFG: <span id="lCfgVal">0.50</span></label><input id="lCfg" type="range" min="0" max="1" step="0.05" value="0.5">
+      </details>
+      <label for="lText">Text (trim to just the part you want spoken)</label>
+      <textarea id="lText" style="min-height:140px"></textarea>
+      <button id="lSpeak" class="btn primary" type="button">Generate audio</button>
+    </div>
+
+    <div id="lDialogue" class="hidden">
+      <div class="row">
+        <div><label for="lVA">Voice A</label><select id="lVA"></select></div>
+        <div><label for="lVB">Voice B</label><select id="lVB"></select></div>
+      </div>
+      <label for="lVN">Narrator</label><select id="lVN"></select>
+      <label for="lDText">Scene text</label>
+      <textarea id="lDText" style="min-height:110px"></textarea>
+      <button id="lSplit" class="btn" type="button" style="width:100%;margin-top:10px">1. Split Scene</button>
+      <div id="lTurns"></div>
+      <button id="lRenderScene" class="btn primary hidden" type="button">2. Render Scene MP3</button>
+    </div>
+    <div id="lMsg" class="msg"></div>
+    <div id="lResult" class="players"></div>
+  </div>
+</div>
 
 <!-- Visualize scene -->
 <div id="vizModal" class="modal hidden">
@@ -342,8 +438,9 @@ $("#logout").addEventListener("click", async () => {
 document.querySelector("nav").addEventListener("click", (e) => {
   const b = e.target.closest("button"); if (!b) return;
   document.querySelectorAll("nav button").forEach(x => x.classList.toggle("on", x === b));
-  ["writer", "studio", "gallery"].forEach(t => $("#tab-" + t).classList.toggle("hidden", t !== b.dataset.tab));
+  ["writer", "studio", "voice", "gallery"].forEach(t => $("#tab-" + t).classList.toggle("hidden", t !== b.dataset.tab));
   if (b.dataset.tab === "gallery") loadGallery();
+  if (b.dataset.tab === "voice") { loadVoices(); loadAudioLib(); }
 });
 
 // ---- enhance
@@ -505,8 +602,12 @@ async function openThread(id) {
   try { localStorage.setItem("wThread", id || ""); } catch {}
   $("#threadMenuBox").classList.add("hidden");
   if (!id) { W.msgs = []; $("#bible").value = ""; renderThread(); return; }
-  const r = await api(`/api/threads/${id}/messages`);
+  const [r, clips] = await Promise.all([
+    api(`/api/threads/${id}/messages`),
+    state.me && state.me.voice_enabled ? api(`/api/audio-history?thread_id=${encodeURIComponent(id)}`).catch(() => ({ items: [] })) : { items: [] },
+  ]);
   W.msgs = r.messages;
+  V.byMsg = {}; clips.items.slice().reverse().forEach(c => { if (c.message_id) (V.byMsg[c.message_id] ||= []).push(c); });
   const t = r.thread;
   $("#wFormat").value = t.format_mode; $("#wLang").value = t.language; $("#wTone").value = t.tone_mode;
   if (W.models.some(m => m.id === t.model_id)) $("#wModel").value = t.model_id;
@@ -584,12 +685,14 @@ function msgEl(m, isLast) {
   }
   d.className = "m-ai";
   const body = document.createElement("div"); body.innerHTML = md(m.content); d.appendChild(body);
+  if (m.id && V.byMsg[m.id]) { const pl = document.createElement("div"); pl.className = "players"; V.byMsg[m.id].forEach(c => pl.appendChild(playerEl(c))); d.appendChild(pl); }
   if (m.id) {
     const acts = document.createElement("div"); acts.className = "m-acts";
     acts.append(
       btn("Copy", async (b) => { try { await navigator.clipboard.writeText(m.content); b.textContent = "Copied"; } catch { b.textContent = "Copy failed"; } }),
       btn("Visualize Scene", () => openViz(m.content)),
     );
+    if (state.me && state.me.voice_enabled) acts.append(btn("Listen", () => openListen({ text: m.content, thread_id: W.tid, message_id: m.id })));
     if (isLast) acts.append(btn("Continue", () => send(CONTINUE)), btn("Regenerate", () => send(null, true)));
     d.appendChild(acts);
   }
@@ -709,12 +812,210 @@ async function renderInline(body) {
   finally { clearInterval(timer); setStreaming(false); }
 }
 
+// ---- voice
+const V = { voices: { male: [], female: [] }, presets: {}, byMsg: {}, ctx: null, mode: "single", preset: "natural", turns: [] };
+function fmtDur(s) { s = Math.round(s || 0); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; }
+function allVoices() { return [...V.voices.male, ...V.voices.female]; }
+
+function playerEl(c, withDelete) {
+  const row = document.createElement("div"); row.className = "player";
+  const a = document.createElement("audio"); a.controls = true; a.preload = "none"; a.src = c.url;
+  const dl = document.createElement("a"); dl.className = "btn small"; dl.textContent = "MP3"; dl.href = c.url + "?download=1";
+  dl.setAttribute("download", c.filename || "audio.mp3");
+  row.append(a, dl);
+  if (withDelete) row.append(btn("×", async () => {
+    if (!confirm("Delete this audio?")) return;
+    try { await api(`/api/audio/${c.id}`, { method: "DELETE" }); row.parentElement && row.parentElement.remove(); } catch (e) { alert(e.message); }
+  }));
+  return row;
+}
+
+async function loadVoices() {
+  try {
+    const r = await api("/api/voices");
+    V.voices = { male: r.male || [], female: r.female || [] }; V.presets = r.presets || {};
+  } catch (e) { $("#voiceList").textContent = e.message; return; }
+  const box = $("#voiceList"); box.innerHTML = "";
+  [["male", "Male voices"], ["female", "Female voices"]].forEach(([g, title]) => {
+    const h = document.createElement("div"); h.className = "hint"; h.style.marginTop = "10px"; h.textContent = title; box.appendChild(h);
+    if (!V.voices[g].length) { const e = document.createElement("div"); e.className = "hint"; e.textContent = "None yet."; box.appendChild(e); }
+    V.voices[g].forEach(v => {
+      const row = document.createElement("div"); row.className = "vrow";
+      const name = document.createElement("div"); name.textContent = v.display_name;
+      const tag = document.createElement("span"); tag.className = "tag"; tag.textContent = v.voice_lang.toUpperCase(); name.appendChild(tag);
+      const acts = document.createElement("div"); acts.style.display = "flex"; acts.style.gap = "6px";
+      const out = document.createElement("div"); out.className = "players";
+      acts.append(btn("Test", async (b) => {
+        b.disabled = true; b.textContent = "…";
+        try {
+          const text = v.voice_lang === "hi" ? "नमस्ते, यह मेरी आवाज़ का एक छोटा सा नमूना है।" : "Hello, this is a short sample of my voice.";
+          const r = await api("/api/tts/speak", { method: "POST", body: { text, voice_id: v.id, language_id: v.voice_lang } });
+          out.innerHTML = ""; const p = playerEl(r); out.appendChild(p); p.querySelector("audio").play().catch(() => {});
+          setUsage(r.usage);
+        } catch (e) { alert(e.message); } finally { b.disabled = false; b.textContent = "Test"; }
+      }));
+      if (v.mine) acts.append(btn("Delete", async () => {
+        if (!confirm(`Delete voice "${v.display_name}"?`)) return;
+        try { await api(`/api/voices/${v.id}`, { method: "DELETE" }); loadVoices(); } catch (e) { alert(e.message); }
+      }));
+      row.append(name, acts); box.append(row, out);
+    });
+  });
+  fillVoiceSelects();
+}
+
+function fillVoiceSelects() {
+  const build = (sel, withOff) => {
+    const prev = sel.value; sel.innerHTML = "";
+    if (withOff) { const o = document.createElement("option"); o.value = ""; o.textContent = "Off"; sel.appendChild(o); }
+    [["male", "Male Voices"], ["female", "Female Voices"]].forEach(([g, label]) => {
+      if (!V.voices[g].length) return;
+      const og = document.createElement("optgroup"); og.label = label;
+      V.voices[g].forEach(v => { const o = document.createElement("option"); o.value = v.id; o.textContent = `${v.display_name} · ${v.voice_lang.toUpperCase()}`; og.appendChild(o); });
+      sel.appendChild(og);
+    });
+    if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
+  };
+  build($("#lVoice")); build($("#lVA")); build($("#lVB")); build($("#lVN"), true);
+  if (!$("#lVB").value || $("#lVB").value === $("#lVA").value) {
+    const other = allVoices().find(v => v.id !== $("#lVA").value); if (other) $("#lVB").value = other.id;
+  }
+}
+
+async function loadAudioLib() {
+  const box = $("#audioLib");
+  try {
+    const r = await api("/api/audio-history"); box.innerHTML = "";
+    if (!r.items.length) { box.innerHTML = '<div class="hint">Nothing yet.</div>'; return; }
+    r.items.forEach(c => {
+      const wrap = document.createElement("div"); wrap.style.marginBottom = "10px";
+      const t = document.createElement("div"); t.className = "hint";
+      t.textContent = `${c.voice_id.startsWith("dialogue:") ? "Scene" : "Voice"} · ${c.language_id.toUpperCase()} · ${fmtDur(c.duration_sec)} · ${c.text_preview.slice(0, 90)}`;
+      wrap.append(t, playerEl(c, true)); box.appendChild(wrap);
+    });
+  } catch (e) { box.textContent = e.message; }
+}
+
+$("#voiceForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = $("#vFile").files[0]; if (!f) return;
+  const fd = new FormData();
+  fd.append("file", f); fd.append("display_name", $("#vName").value); fd.append("gender", $("#vGender").value);
+  fd.append("voice_lang", $("#vLang").value); fd.append("preset", $("#vPreset").value);
+  fd.append("consent", $("#vConsent").checked ? "true" : "false");
+  $("#vMsg").className = "msg"; $("#vMsg").textContent = "Uploading… (first upload may take ~1 min while the voice worker wakes)";
+  try {
+    const res = await fetch("/api/voices", { method: "POST", body: fd, credentials: "same-origin", headers: { "X-Requested-With": "canvas" } });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(typeof j.detail === "string" ? j.detail : `Error ${res.status}`);
+    $("#vMsg").className = "msg ok"; $("#vMsg").textContent = `Added "${j.display_name}" (${j.reference_seconds}s reference)`;
+    $("#voiceForm").reset(); loadVoices();
+  } catch (err) { $("#vMsg").className = "msg err"; $("#vMsg").textContent = err.message; }
+});
+
+// listen modal
+const setLMode = segment("#lMode", v => { V.mode = v; $("#lSingle").classList.toggle("hidden", v !== "single"); $("#lDialogue").classList.toggle("hidden", v !== "dialogue"); });
+const setLPreset = segment("#lPreset", v => { V.preset = v; const p = V.presets[v]; if (p) { setSlider("#lExg", p[0]); setSlider("#lCfg", p[1]); } });
+function setSlider(id, v) { $(id).value = v; $(id + "Val").textContent = (+v).toFixed(2); }
+["#lExg", "#lCfg"].forEach(id => $(id).addEventListener("input", e => $(id + "Val").textContent = (+e.target.value).toFixed(2)));
+$("#lLang").addEventListener("change", () => $("#lHinglishRow").classList.toggle("hidden", $("#lLang").value !== "hi"));
+$("#lClose").addEventListener("click", () => $("#listenModal").classList.add("hidden"));
+$("#openNarrate").addEventListener("click", () => openListen({ text: "" }));
+$("#lVoice").addEventListener("change", () => {
+  const v = allVoices().find(x => x.id === $("#lVoice").value);
+  if (v) { setSlider("#lExg", v.default_exaggeration); setSlider("#lCfg", v.default_cfg); setLPreset("none"); }
+});
+
+async function openListen(ctx) {
+  V.ctx = ctx; V.turns = [];
+  if (!allVoices().length) await loadVoices();
+  if (!allVoices().length) { alert("Add a voice in the Voice tab first."); return; }
+  const text = (ctx.text || "").trim();
+  $("#lText").value = text; $("#lDText").value = text;
+  const hasDeva = /[\u0900-\u097F]/.test(text), thread = curThread();
+  $("#lLang").value = hasDeva || (thread && ["hi", "hinglish", "bilingual"].includes(thread.language)) ? "hi" : "en";
+  $("#lHinglishRow").classList.toggle("hidden", $("#lLang").value !== "hi");
+  $("#lTurns").innerHTML = ""; $("#lRenderScene").classList.add("hidden");
+  $("#lMsg").textContent = ""; $("#lResult").innerHTML = "";
+  const looksLikeScene = /^\s*\**[A-Z][A-Z .'-]{1,30}\**\s*:/m.test(text);
+  setLMode(looksLikeScene ? "dialogue" : "single"); V.mode = looksLikeScene ? "dialogue" : "single";
+  $("#lSingle").classList.toggle("hidden", V.mode !== "single"); $("#lDialogue").classList.toggle("hidden", V.mode !== "dialogue");
+  $("#lVoice").dispatchEvent(new Event("change"));
+  $("#listenModal").classList.remove("hidden");
+}
+
+function lBusy(on, label) {
+  ["#lSpeak", "#lSplit", "#lRenderScene"].forEach(id => $(id).disabled = on);
+  if (!on) return null;
+  const t0 = Date.now(); const tick = () => { $("#lMsg").className = "msg"; $("#lMsg").textContent = `${label} ${Math.round((Date.now() - t0) / 1000)}s`; };
+  tick(); return setInterval(tick, 1000);
+}
+function lDone(r) {
+  $("#lMsg").className = "msg ok"; $("#lMsg").textContent = `Ready · ${fmtDur(r.duration_sec)}${r.cold_start ? " (voice worker was asleep)" : ""} · saved to Voice › Saved audio`;
+  const p = playerEl(r); $("#lResult").innerHTML = ""; $("#lResult").appendChild(p); p.querySelector("audio").play().catch(() => {});
+  setUsage(r.usage);
+  if (r.message_id) { (V.byMsg[r.message_id] ||= []).push(r); renderThread(); }
+}
+
+$("#lSpeak").addEventListener("click", async () => {
+  const text = $("#lText").value.trim(); if (!text) return;
+  const timer = lBusy(true, "Generating voice on Modal T4… (~40–60s if asleep)");
+  try {
+    const r = await api("/api/tts/speak", { method: "POST", body: {
+      text, voice_id: $("#lVoice").value, language_id: $("#lLang").value, exaggeration: +$("#lExg").value,
+      cfg_weight: +$("#lCfg").value, convert_hinglish: $("#lLang").value === "hi" && $("#lHinglish").checked,
+      thread_id: V.ctx.thread_id || null, message_id: V.ctx.message_id || null } });
+    lDone(r);
+  } catch (e) { $("#lMsg").className = "msg err"; $("#lMsg").textContent = e.message; }
+  finally { clearInterval(timer); lBusy(false); }
+});
+
+function renderTurns() {
+  const box = $("#lTurns"); box.innerHTML = "";
+  V.turns.forEach((t, i) => {
+    const row = document.createElement("div"); row.className = "turn";
+    const sel = document.createElement("select");
+    [["A", "A"], ["B", "B"], ["narrator", "Narrator"]].forEach(([v, l]) => { const o = document.createElement("option"); o.value = v; o.textContent = l; sel.appendChild(o); });
+    sel.value = t.slot; sel.title = t.speaker_name || ""; sel.addEventListener("change", () => t.slot = sel.value);
+    const ta = document.createElement("textarea"); ta.value = t.text; ta.addEventListener("input", () => t.text = ta.value);
+    const x = btn("×", () => { V.turns.splice(i, 1); renderTurns(); });
+    row.append(sel, ta, x); box.appendChild(row);
+  });
+  $("#lRenderScene").classList.toggle("hidden", !V.turns.length);
+}
+
+$("#lSplit").addEventListener("click", async () => {
+  const text = $("#lDText").value.trim(); if (!text) return;
+  const timer = lBusy(true, "Splitting scene into lines…");
+  try {
+    const r = await api("/api/tts/parse-dialogue", { method: "POST", body: {
+      text, language_id: $("#lLang").value, convert_hinglish: $("#lHinglish").checked, include_narrator: !!$("#lVN").value } });
+    V.turns = r.turns; renderTurns();
+    $("#lMsg").className = "msg ok"; $("#lMsg").textContent = `${r.turns.length} lines${r.characters.length ? " · " + r.characters.join(", ") : ""} — review, then render`;
+  } catch (e) { $("#lMsg").className = "msg err"; $("#lMsg").textContent = e.message; }
+  finally { clearInterval(timer); lBusy(false); }
+});
+
+$("#lRenderScene").addEventListener("click", async () => {
+  const turns = V.turns.filter(t => t.text.trim()).map(t => ({ slot: t.slot, speaker_name: t.speaker_name || "", text: t.text.trim(), preset: t.preset || null }));
+  if (!turns.length) return;
+  const voice_map = { A: $("#lVA").value, B: $("#lVB").value }; if ($("#lVN").value) voice_map.narrator = $("#lVN").value;
+  const timer = lBusy(true, "Generating multi-voice scene on Modal T4…");
+  try {
+    const r = await api("/api/tts/dialogue", { method: "POST", body: {
+      language_id: $("#lLang").value, voice_map, turns, thread_id: V.ctx.thread_id || null, message_id: V.ctx.message_id || null } });
+    lDone(r);
+  } catch (e) { $("#lMsg").className = "msg err"; $("#lMsg").textContent = e.message; }
+  finally { clearInterval(timer); lBusy(false); }
+});
+
 // ---- boot
 async function boot() {
   try {
     const me = await api("/api/me");
     state.me = me;
     $("#navWriter").classList.toggle("hidden", !me.writer_enabled);
+    $("#navVoice").classList.toggle("hidden", !me.voice_enabled);
     setUsage(me.usage);
     show("app");
     if (me.writer_enabled) {
