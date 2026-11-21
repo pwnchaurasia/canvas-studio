@@ -161,19 +161,24 @@ class TTSWorker:
 
         return np.zeros(int(self.sr * ms / 1000), dtype=np.float32)
 
-    def _mp3(self, x) -> bytes:
+    def _mp3(self, x, frames_only: bool = False) -> bytes:
+        """128 kbps MP3. frames_only drops the ID3/Xing headers so parts can be byte-concatenated."""
         import numpy as np
 
+        extra = ["-write_xing", "0", "-id3v2_version", "0", "-write_id3v1", "0"] if frames_only else []
         proc = subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "f32le", "-ar", str(self.sr), "-ac", "1",
-             "-i", "pipe:0", "-codec:a", "libmp3lame", "-b:a", "128k", "-f", "mp3", "pipe:1"],
+             "-i", "pipe:0", "-codec:a", "libmp3lame", "-b:a", "128k", *extra, "-f", "mp3", "pipe:1"],
             input=np.ascontiguousarray(x, dtype=np.float32).tobytes(), capture_output=True, check=True,
         )
         return proc.stdout
 
-    def _response(self, audio, t0: float):
+    def _response(self, audio, t0: float, frames_only: bool = False, lead_silence_ms: int = 0):
+        import numpy as np
         from fastapi import Response
 
+        if lead_silence_ms:
+            audio = np.concatenate([self._silence(lead_silence_ms), audio])
         duration = len(audio) / self.sr
         gen_s = round(time.perf_counter() - t0, 2)
         cold, self.cold = self.cold, False
@@ -184,7 +189,7 @@ class TTSWorker:
             "X-Load-Seconds": str(self.load_s if cold else 0.0),
         }
         print(f"Synthesized {duration:.1f}s of audio in {gen_s}s (cold={cold})")
-        return Response(content=self._mp3(audio), media_type="audio/mpeg", headers=headers)
+        return Response(content=self._mp3(audio, frames_only), media_type="audio/mpeg", headers=headers)
 
     # ---- web app
 
@@ -216,6 +221,8 @@ class TTSWorker:
             voice_lang: str = Field(default="en", pattern="^(en|hi)$")
             exaggeration: float = Field(default=0.5, ge=0.0, le=2.0)
             cfg_weight: float = Field(default=0.5, ge=0.0, le=1.0)
+            frames_only: bool = False
+            lead_silence_ms: int = Field(default=0, ge=0, le=2000)
 
         class Turn(BaseModel):
             speaker: str = Field(default="A", max_length=32)
@@ -228,6 +235,8 @@ class TTSWorker:
         class Dialogue(BaseModel):
             language_id: str = Field(default="en", pattern="^(en|hi)$")
             turns: list[Turn] = Field(min_length=1, max_length=MAX_TURNS)
+            frames_only: bool = False
+            lead_silence_ms: int = Field(default=0, ge=0, le=2000)
 
         @api.post("/voices/upload")
         def upload(req: Upload, x_api_key: str | None = Header(default=None)):
@@ -278,7 +287,7 @@ class TTSWorker:
                 if i:
                     parts.append(self._silence(GAP_SENTENCE_MS))
                 parts.append(self._speak(chunk, req.language_id, req.exaggeration, cfg))
-            return self._response(self._normalize(np.concatenate(parts)), t0)
+            return self._response(self._normalize(np.concatenate(parts)), t0, req.frames_only, req.lead_silence_ms)
 
         @api.post("/synthesize-dialogue")
         def synthesize_dialogue(req: Dialogue, x_api_key: str | None = Header(default=None)):
@@ -304,6 +313,6 @@ class TTSWorker:
                 prev = turn.speaker
             if not parts:
                 raise HTTPException(status_code=422, detail="nothing to speak after cleanup")
-            return self._response(np.concatenate(parts), t0)
+            return self._response(np.concatenate(parts), t0, req.frames_only, req.lead_silence_ms)
 
         return api

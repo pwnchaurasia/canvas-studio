@@ -1,6 +1,7 @@
 """Voice: shared voice bank (consented reference clips), single-voice narration, and multi-speaker
 scene dialogue rendered on the Modal TTS worker. Audio files are private to the user who made them."""
 
+import asyncio
 import base64
 import json
 import re
@@ -24,7 +25,9 @@ TTS_IDLE_S = 20                       # scaledown_window on the TTS worker
 T4_TO_L4_COST = 0.000164 / 0.000222   # TTS seconds expressed in image-GPU budget seconds
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 ALLOWED_EXT = {".wav", ".mp3", ".m4a"}
-MAX_SPEAK_CHARS = 6000
+MAX_SPEAK_CHARS = 30000          # ~5,000 words; long text is rendered as a background job in parts
+PART_CHARS = 1200                # ~90 s of speech per worker request, far below any proxy timeout
+PART_TURNS = 10
 AUDIO_RE = re.compile(r"^([a-z0-9-]{1,32})_(\d{10,16})_([a-f0-9]{6})(_dlg)?\.mp3$")
 VOICE_ID_RE = re.compile(r"^[a-z0-9_-]{1,48}$")
 
@@ -79,8 +82,27 @@ class VoiceStore:
                     created_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_audio_user ON audio_clips(user, created_at);
+                CREATE TABLE IF NOT EXISTS tts_jobs (
+                    id TEXT PRIMARY KEY,
+                    user TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    parts_total INTEGER NOT NULL,
+                    parts_done INTEGER NOT NULL DEFAULT 0,
+                    clip_id TEXT,
+                    error TEXT,
+                    thread_id TEXT,
+                    message_id INTEGER,
+                    text_preview TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_tts_jobs_user ON tts_jobs(user, created_at);
                 """
             )
+            # jobs run inside this process; anything unfinished at startup was interrupted by a restart
+            c.execute("UPDATE tts_jobs SET status = 'error', error = 'Interrupted by a server restart; please retry', "
+                      "updated_at = ? WHERE status IN ('queued', 'running')", (int(time.time()),))
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -140,6 +162,31 @@ class VoiceStore:
         with self._conn() as c:
             c.execute("DELETE FROM audio_clips WHERE id = ? AND user = ?", (clip_id, user))
 
+    def add_job(self, row: dict) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO tts_jobs (id, user, kind, status, parts_total, thread_id, message_id, text_preview, "
+                "created_at, updated_at) VALUES (:id, :user, :kind, 'queued', :parts_total, :thread_id, :message_id, "
+                ":text_preview, :now, :now)",
+                {**row, "now": int(time.time())},
+            )
+
+    def update_job(self, job_id: str, **fields) -> None:
+        cols = ", ".join(f"{k} = :{k}" for k in fields)
+        with self._conn() as c:
+            c.execute(f"UPDATE tts_jobs SET {cols}, updated_at = :now WHERE id = :id",
+                      {**fields, "now": int(time.time()), "id": job_id})
+
+    def job(self, user: str, job_id: str) -> dict | None:
+        with self._conn() as c:
+            r = c.execute("SELECT * FROM tts_jobs WHERE id = ? AND user = ?", (job_id, user)).fetchone()
+        return dict(r) if r else None
+
+    def jobs(self, user: str, limit: int = 10) -> list[dict]:
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM tts_jobs WHERE user = ? ORDER BY created_at DESC LIMIT ?", (user, limit))]
+
     def tts_gpu_seconds_this_month(self, user: str | None = None) -> float:
         t = time.gmtime()
         start = int(time.mktime((t.tm_year, t.tm_mon, 1, 0, 0, 0, 0, 0, 0)) - time.timezone)
@@ -158,6 +205,43 @@ def latin_majority(text: str) -> bool:
     latin = len(re.findall(r"[A-Za-z]", text))
     deva = len(re.findall(r"[ऀ-ॿ]", text))
     return latin > deva
+
+
+def split_parts(text: str, limit: int = PART_CHARS) -> list[str]:
+    """Split long text into parts of at most `limit` chars on paragraph, then sentence, boundaries."""
+    sentences: list[str] = []
+    for para in re.split(r"\n\s*\n", text.strip()):
+        para = para.strip()
+        if not para:
+            continue
+        sents = [x.strip() for x in re.split(r"(?<=[.!?।॥…])\s+|\n+", para) if x.strip()]
+        for sent in sents:
+            while len(sent) > limit:
+                cut = max(sent.rfind(",", 0, limit), sent.rfind(" ", 0, limit))
+                cut = cut if cut > limit // 3 else limit
+                sentences.append(sent[: cut + 1].strip())
+                sent = sent[cut + 1 :].strip()
+            if sent:
+                sentences.append(sent)
+        if sentences:
+            sentences[-1] += "\n"  # remember paragraph ends for nicer joins
+    parts: list[str] = []
+    for sent in sentences:
+        if parts and len(parts[-1]) + 1 + len(sent) <= limit:
+            parts[-1] = f"{parts[-1]} {sent}"
+        else:
+            parts.append(sent)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def group_turns(turns: list[dict], limit: int = PART_CHARS, max_turns: int = PART_TURNS) -> list[list[dict]]:
+    groups: list[list[dict]] = []
+    for t in turns:
+        if groups and len(groups[-1]) < max_turns and sum(len(x["text"]) for x in groups[-1]) + len(t["text"]) <= limit:
+            groups[-1].append(t)
+        else:
+            groups.append([t])
+    return groups
 
 
 def slugify(name: str) -> str:
@@ -202,7 +286,7 @@ class TurnIn(BaseModel):
 class DialogueBody(BaseModel):
     language_id: Literal["en", "hi"] = "en"
     voice_map: dict[Literal["A", "B", "narrator"], str]
-    turns: list[TurnIn] = Field(min_length=1, max_length=30)
+    turns: list[TurnIn] = Field(min_length=1, max_length=150)
     thread_id: str | None = Field(default=None, max_length=64)
     message_id: int | None = None
 
@@ -254,24 +338,6 @@ def build_router(
     def check_thread(user: str, thread_id: str | None) -> None:
         if thread_id:
             wstore.get_thread(user, thread_id)  # 404 if not owned
-
-    def save_audio(user: str, r: httpx.Response, *, voice_id: str, language_id: str, text: str,
-                   thread_id: str | None, message_id: int | None, dialogue: bool) -> dict:
-        clip_id = secrets.token_hex(3)
-        filename = f"{user}_{int(time.time() * 1000)}_{clip_id}{'_dlg' if dialogue else ''}.mp3"
-        (audio_dir / filename).write_bytes(r.content)
-        duration = float(r.headers.get("X-Audio-Duration") or 0)
-        gen_s = float(r.headers.get("X-Gen-Seconds") or 0)
-        load_s = float(r.headers.get("X-Load-Seconds") or 0)
-        gpu_sec = round((gen_s + load_s + TTS_IDLE_S) * T4_TO_L4_COST, 2)
-        vstore.add_clip({
-            "id": clip_id, "user": user, "thread_id": thread_id, "message_id": message_id, "voice_id": voice_id,
-            "language_id": language_id, "filename": filename, "text_preview": text[:200],
-            "duration_sec": duration, "estimated_gpu_sec": gpu_sec, "created_at": int(time.time()),
-        })
-        return {"id": clip_id, "url": f"/api/audio/{filename}", "filename": filename, "duration_sec": duration,
-                "message_id": message_id, "thread_id": thread_id, "voice_id": voice_id,
-                "cold_start": r.headers.get("X-Cold-Start") == "1", "usage": usage(user)}
 
     async def to_devanagari(user: str, text: str) -> str:
         if not settings.llm_enabled:
@@ -344,6 +410,107 @@ def build_router(
         vstore.delete_voice(voice_id)
         return {"ok": True}
 
+    # ---- background jobs (long scripts are rendered part by part, then joined into one MP3)
+
+    job_lock = asyncio.Lock()          # one job at a time: the worker has a single GPU container
+    cancelled: set[str] = set()
+    running: dict[str, asyncio.Task] = {}
+    results: dict[str, dict] = {}       # job_id -> extra result fields (e.g. spoken text)
+
+    def job_view(user: str, job_id: str) -> dict:
+        j = vstore.job(user, job_id)
+        if not j:
+            raise HTTPException(status_code=404, detail="job not found")
+        out = {k: j[k] for k in ("id", "kind", "status", "parts_total", "parts_done", "error", "thread_id",
+                                  "message_id", "text_preview", "created_at")}
+        if j["status"] == "done" and j["clip_id"]:
+            clip = vstore.clip(user, j["clip_id"])
+            if clip:
+                out["clip"] = {**clip, "url": f"/api/audio/{clip['filename']}"}
+            out.update(results.get(job_id, {}))
+        if j["status"] in ("done", "error", "cancelled"):
+            out["usage"] = usage(user)
+        return out
+
+    async def run_job(job: dict, parts: list[tuple[str, dict]], finish: dict) -> None:
+        jid, user = job["id"], job["user"]
+        audio: list[bytes] = []
+        duration = gen_s = load_s = 0.0
+        cold = False
+        try:
+            async with job_lock:
+                vstore.update_job(jid, status="running")
+                for n, (path, payload) in enumerate(parts, 1):
+                    if jid in cancelled:
+                        vstore.update_job(jid, status="cancelled")
+                        return
+                    if finish.get("transliterate") and payload.get("text"):
+                        payload["text"] = await to_devanagari(user, payload["text"])
+                        results.setdefault(jid, {}).setdefault("spoken_parts", []).append(payload["text"])
+                    for attempt in (1, 2):  # one retry per part for transient worker/network errors
+                        try:
+                            r = await tts_call(path, {**payload, "frames_only": True})
+                            break
+                        except HTTPException:
+                            if attempt == 2:
+                                raise
+                            await asyncio.sleep(5)
+                    audio.append(r.content)
+                    duration += float(r.headers.get("X-Audio-Duration") or 0)
+                    gen_s += float(r.headers.get("X-Gen-Seconds") or 0)
+                    if r.headers.get("X-Cold-Start") == "1":
+                        cold, load_s = True, float(r.headers.get("X-Load-Seconds") or 0)
+                    vstore.update_job(jid, parts_done=n)
+            clip_id = secrets.token_hex(3)
+            filename = f"{user}_{int(time.time() * 1000)}_{clip_id}{'_dlg' if job['kind'] == 'dialogue' else ''}.mp3"
+            (audio_dir / filename).write_bytes(b"".join(audio))
+            vstore.add_clip({
+                "id": clip_id, "user": user, "thread_id": job.get("thread_id"), "message_id": job.get("message_id"),
+                "voice_id": finish["voice_label"], "language_id": finish["language_id"], "filename": filename,
+                "text_preview": job["text_preview"], "duration_sec": round(duration, 2),
+                "estimated_gpu_sec": round((gen_s + load_s + TTS_IDLE_S) * T4_TO_L4_COST, 2),
+                "created_at": int(time.time()),
+            })
+            res = results.setdefault(jid, {})
+            res["cold_start"] = cold
+            if "spoken_parts" in res:
+                res["spoken_text"] = " ".join(res.pop("spoken_parts"))
+            vstore.update_job(jid, status="done", clip_id=clip_id)
+        except HTTPException as e:
+            vstore.update_job(jid, status="error", error=str(e.detail)[:300])
+        except Exception as e:  # keep the job record honest even on unexpected failures
+            vstore.update_job(jid, status="error", error=f"{type(e).__name__}: {str(e)[:200]}")
+        finally:
+            cancelled.discard(jid)
+            running.pop(jid, None)
+
+    def start_job(user: str, kind: str, parts: list[tuple[str, dict]], finish: dict,
+                  thread_id: str | None, message_id: int | None, preview: str) -> dict:
+        if sum(1 for j in vstore.jobs(user, 20) if j["status"] in ("queued", "running")) >= 3:
+            raise HTTPException(status_code=429, detail="You already have 3 audio jobs in progress")
+        job = {"id": secrets.token_hex(6), "user": user, "kind": kind, "parts_total": len(parts),
+               "thread_id": thread_id, "message_id": message_id, "text_preview": preview[:200]}
+        vstore.add_job(job)
+        running[job["id"]] = asyncio.create_task(run_job(job, parts, finish))
+        return job_view(user, job["id"])
+
+    @router.get("/tts/jobs")
+    def list_jobs(user: str = Depends(require_user)) -> dict:
+        return {"jobs": [job_view(user, j["id"]) for j in vstore.jobs(user)]}
+
+    @router.get("/tts/jobs/{job_id}")
+    def get_job(job_id: str, user: str = Depends(require_user)) -> dict:
+        return job_view(user, job_id)
+
+    @router.delete("/tts/jobs/{job_id}", dependencies=mutate)
+    def cancel_job(job_id: str, user: str = Depends(require_user)) -> dict:
+        j = vstore.job(user, job_id)
+        if not j:
+            raise HTTPException(status_code=404, detail="job not found")
+        if j["status"] in ("queued", "running"):
+            cancelled.add(job_id)
+        return {"ok": True}
+
     # ---- single voice
 
     @router.post("/tts/speak", dependencies=mutate)
@@ -355,17 +522,19 @@ def build_router(
             raise HTTPException(status_code=400, detail="unknown voice")
         if not budget_left():
             raise HTTPException(status_code=429, detail="Monthly GPU budget reached")
-        text = body.text
-        if body.language_id == "hi" and (body.convert_hinglish or latin_majority(text)):
-            text = await to_devanagari(user, text)
-        r = await tts_call("/synthesize", {
-            "text": text, "voice_id": body.voice_id, "language_id": body.language_id, "voice_lang": v["voice_lang"],
+        texts = split_parts(body.text)
+        if not texts:
+            raise HTTPException(status_code=422, detail="nothing to speak")
+        base = {
+            "voice_id": body.voice_id, "language_id": body.language_id, "voice_lang": v["voice_lang"],
             "exaggeration": body.exaggeration if body.exaggeration is not None else v["default_exaggeration"],
             "cfg_weight": body.cfg_weight if body.cfg_weight is not None else v["default_cfg"],
-        })
-        out = save_audio(user, r, voice_id=body.voice_id, language_id=body.language_id, text=text,
-                         thread_id=body.thread_id, message_id=body.message_id, dialogue=False)
-        return {**out, "spoken_text": text}
+        }
+        parts = [("/synthesize", {**base, "text": t, "lead_silence_ms": 300 if i else 0}) for i, t in enumerate(texts)]
+        translit = body.language_id == "hi" and (body.convert_hinglish or latin_majority(body.text))
+        return start_job(user, "single", parts,
+                         {"voice_label": body.voice_id, "language_id": body.language_id, "transliterate": translit},
+                         body.thread_id, body.message_id, body.text)
 
     # ---- scene dialogue
 
@@ -385,7 +554,7 @@ def build_router(
         raw, usage_info = await llm.complete(
             [{"role": "system", "content": PARSE_PROMPT.format(narrator_rule=narrator_rule, language_rule=language_rule)},
              {"role": "user", "content": body.text}],
-            model=settings.llm_default_model, temperature=0.2, max_tokens=6000,
+            model=settings.llm_default_model, temperature=0.2, max_tokens=8000,
         )
         wstore.log_usage(user, "parse", settings.llm_default_model, usage_info, body.text, raw)
         try:
@@ -407,7 +576,7 @@ def build_router(
         if not turns:
             raise HTTPException(status_code=422, detail="No spoken lines found in this text")
         chars = [str(c)[:60] for c in (data.get("characters") or []) if isinstance(c, (str, int))][:10]
-        return {"characters": chars, "turns": turns[:30]}
+        return {"characters": chars, "turns": turns[:150]}
 
     @router.post("/tts/dialogue", dependencies=mutate)
     async def dialogue(body: DialogueBody, user: str = Depends(require_user)) -> dict:
@@ -428,11 +597,14 @@ def build_router(
             exg, cfg = PRESETS[t.preset] if t.preset else (v["default_exaggeration"], v["default_cfg"])
             turns.append({"speaker": t.slot, "voice_id": v["id"], "voice_lang": v["voice_lang"], "text": t.text,
                           "exaggeration": exg, "cfg_weight": cfg})
-        r = await tts_call("/synthesize-dialogue", {"language_id": body.language_id, "turns": turns})
+        parts, prev = [], None
+        for group in group_turns(turns):
+            lead = 0 if prev is None else (400 if group[0]["speaker"] != prev else 200)
+            parts.append(("/synthesize-dialogue", {"language_id": body.language_id, "turns": group, "lead_silence_ms": lead}))
+            prev = group[-1]["speaker"]
         label = "dialogue:" + "+".join(sorted(voices))
-        preview = " / ".join(t.text for t in body.turns)
-        return save_audio(user, r, voice_id=label, language_id=body.language_id, text=preview,
-                          thread_id=body.thread_id, message_id=body.message_id, dialogue=True)
+        return start_job(user, "dialogue", parts, {"voice_label": label, "language_id": body.language_id},
+                         body.thread_id, body.message_id, " / ".join(t.text for t in body.turns))
 
     # ---- audio library
 

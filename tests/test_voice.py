@@ -1,4 +1,5 @@
 import json
+import time
 
 import httpx
 import pytest
@@ -45,13 +46,30 @@ def vclient(env, renderer, llm, tts, monkeypatch):
     monkeypatch.setenv("MODAL_TTS_URL", "https://tts.test")
     monkeypatch.setenv("STUDIO_API_KEY", "studio-key")
 
+    clients = []
+
     def _make(user, password):
         app = server.create_app(renderer=renderer, llm_transport=httpx.MockTransport(llm),
                                 tts_transport=httpx.MockTransport(tts))
         c = TestClient(app)
+        c.__enter__()  # keep one event loop alive so background jobs keep running between requests
+        clients.append(c)
         assert c.post("/api/login", json={"username": user, "password": password}, headers=HEADERS).status_code == 200
         return c
-    return _make
+    yield _make
+    for c in clients:
+        c.__exit__(None, None, None)
+
+
+def wait(c, r):
+    assert r.status_code == 200, r.text
+    job = r.json()
+    for _ in range(200):
+        job = c.get(f"/api/tts/jobs/{job['id']}").json()
+        if job["status"] in ("done", "error", "cancelled"):
+            return job
+        time.sleep(0.02)
+    raise AssertionError(f"job stuck: {job}")
 
 
 def upload(c, name="Dev", gender="male", lang="en", consent="true", data=b"RIFF" + b"\x01" * 4000, fname="a.wav"):
@@ -96,12 +114,14 @@ def test_voice_shared_but_only_owner_deletes(vclient, env):
 def test_speak_saves_mp3_and_isolates_users(vclient, tts, env):
     alice, bob = vclient("alice", "pw-a"), vclient("bob", "pw-b")
     vid = upload(alice).json()["id"]
-    r = alice.post("/api/tts/speak", json={"text": "Hello there.", "voice_id": vid, "language_id": "en"}, headers=HEADERS)
-    assert r.status_code == 200, r.text
-    out = r.json()
+    job = wait(alice, alice.post("/api/tts/speak", json={"text": "Hello there.", "voice_id": vid, "language_id": "en"}, headers=HEADERS))
+    assert job["status"] == "done" and job["parts_total"] == 1, job
+    out = job["clip"]
     assert out["duration_sec"] == 4.2 and out["url"].startswith("/api/audio/alice_")
     path, body, _ = tts.calls[-1]
     assert path == "/synthesize" and body["voice_lang"] == "en" and body["exaggeration"] == 0.65
+    assert body["frames_only"] is True and body["lead_silence_ms"] == 0
+    assert bob.get(f"/api/tts/jobs/{job['id']}").status_code == 404
     got = alice.get(out["url"])
     assert got.status_code == 200 and got.content == MP3 and got.headers["content-type"] == "audio/mpeg"
     assert bob.get(out["url"]).status_code == 403
@@ -113,21 +133,21 @@ def test_speak_saves_mp3_and_isolates_users(vclient, tts, env):
     assert alice.delete(f"/api/audio/{out['id']}", headers=HEADERS).status_code == 200
     assert alice.get(out["url"]).status_code == 404
     # cold start + idle window counted against the shared GPU budget
-    assert out["usage"]["gpu_minutes_total"] > 0
+    assert job["usage"]["gpu_minutes_total"] > 0
 
 
 def test_hinglish_transliterated_before_tts(vclient, tts, llm):
     c = vclient("alice", "pw-a")
     vid = upload(c).json()["id"]
     llm.completion = "तुम कब आए?"
-    r = c.post("/api/tts/speak", json={"text": "Tum kab aaye?", "voice_id": vid, "language_id": "hi"}, headers=HEADERS)
-    assert r.status_code == 200 and r.json()["spoken_text"] == "तुम कब आए?"
+    job = wait(c, c.post("/api/tts/speak", json={"text": "Tum kab aaye?", "voice_id": vid, "language_id": "hi"}, headers=HEADERS))
+    assert job["status"] == "done" and job["spoken_text"] == "तुम कब आए?"
     assert "Devanagari" in llm.requests[-1]["messages"][0]["content"]
     _, body, _ = tts.calls[-1]
     assert body["text"] == "तुम कब आए?" and body["language_id"] == "hi" and body["voice_lang"] == "en"
     # English output: no transliteration call
     n = len(llm.requests)
-    c.post("/api/tts/speak", json={"text": "Hello", "voice_id": vid, "language_id": "en"}, headers=HEADERS)
+    wait(c, c.post("/api/tts/speak", json={"text": "Hello", "voice_id": vid, "language_id": "en"}, headers=HEADERS))
     assert len(llm.requests) == n
 
 
@@ -170,13 +190,13 @@ def test_dialogue_render(vclient, tts):
              {"slot": "narrator", "text": "Silence."}]
     r = alice.post("/api/tts/dialogue", json={"voice_map": {"A": a, "B": b}, "turns": turns}, headers=HEADERS)
     assert r.status_code == 400 and "Narrator" in r.json()["detail"]
-    r = alice.post("/api/tts/dialogue", json={"voice_map": {"A": a, "B": b}, "turns": turns[:2]}, headers=HEADERS)
-    assert r.status_code == 200, r.text
+    job = wait(alice, alice.post("/api/tts/dialogue", json={"voice_map": {"A": a, "B": b}, "turns": turns[:2]}, headers=HEADERS))
+    assert job["status"] == "done", job
     path, body, _ = tts.calls[-1]
     assert path == "/synthesize-dialogue" and body["language_id"] == "en"
     assert [(t["speaker"], t["voice_id"], t["voice_lang"]) for t in body["turns"]] == [("A", a, "en"), ("B", b, "hi")]
     assert body["turns"][0]["exaggeration"] == 0.65 and body["turns"][0]["cfg_weight"] == 0.3
-    out = r.json()
+    out = job["clip"]
     assert out["filename"].endswith("_dlg.mp3")
     assert alice.get(out["url"]).status_code == 200 and bob.get(out["url"]).status_code == 403
     clip = alice.get("/api/audio-history").json()["items"][0]
@@ -193,3 +213,57 @@ def test_voice_disabled_without_worker(env, renderer):
 
 def test_latin_majority():
     assert voice.latin_majority("Tum kab aaye?") and not voice.latin_majority("तुम कब आए?")
+
+
+# ---------------------------------------------------------------- long scripts
+
+
+def test_split_parts():
+    text = ("This is a sentence that keeps going. " * 40 + "\n\n") * 3 + "रिया आई। " * 50
+    parts = voice.split_parts(text)
+    assert len(parts) > 3 and all(len(p) <= voice.PART_CHARS for p in parts)
+    assert "".join(parts).replace(" ", "").replace("\n", "") == text.replace(" ", "").replace("\n", "")
+
+
+def test_long_script_renders_in_parts_and_joins(vclient, tts, env):
+    c = vclient("alice", "pw-a")
+    vid = upload(c).json()["id"]
+    text = "The keeper climbed the stairs again that night. " * 120  # ~5,900 chars, ~1,000 words
+    job = wait(c, c.post("/api/tts/speak", json={"text": text, "voice_id": vid}, headers=HEADERS))
+    assert job["status"] == "done" and job["parts_total"] == job["parts_done"] >= 5, job
+    synth = [b for p, b, _ in tts.calls if p == "/synthesize"]
+    assert len(synth) == job["parts_total"]
+    assert all(len(b["text"]) <= voice.PART_CHARS for b in synth)
+    assert synth[0]["lead_silence_ms"] == 0 and all(b["lead_silence_ms"] == 300 for b in synth[1:])
+    data = c.get(job["clip"]["url"]).content
+    assert data == MP3 * job["parts_total"]
+    assert job["clip"]["duration_sec"] == round(4.2 * job["parts_total"], 2)
+
+
+def test_long_dialogue_grouped(vclient, tts):
+    c = vclient("alice", "pw-a")
+    a = upload(c, name="A1").json()["id"]
+    b = upload(c, name="B1", gender="female").json()["id"]
+    turns = [{"slot": "A" if i % 2 == 0 else "B", "text": f"Line number {i}."} for i in range(25)]
+    job = wait(c, c.post("/api/tts/dialogue", json={"voice_map": {"A": a, "B": b}, "turns": turns}, headers=HEADERS))
+    assert job["status"] == "done" and job["parts_total"] == 3, job
+    calls = [b for p, b, _ in tts.calls if p == "/synthesize-dialogue"]
+    assert [len(x["turns"]) for x in calls] == [10, 10, 5]
+    assert calls[0]["lead_silence_ms"] == 0 and calls[1]["lead_silence_ms"] == 400
+
+
+def test_failed_part_marks_job_error(vclient, tts):
+    c = vclient("alice", "pw-a")
+    vid = upload(c).json()["id"]
+    orig = tts.__call__
+
+    def failing(request):
+        if request.url.path == "/synthesize":
+            return httpx.Response(503, json={"detail": "worker busy"})
+        return orig(request)
+    tts.__class__.__call__ = lambda self, req: failing(req)
+    try:
+        job = wait(c, c.post("/api/tts/speak", json={"text": "Hello.", "voice_id": vid}, headers=HEADERS))
+    finally:
+        tts.__class__.__call__ = FakeTTS.__dict__["__call__"] if "__call__" in FakeTTS.__dict__ else orig
+    assert job["status"] == "error" and "worker busy" in job["error"]

@@ -849,9 +849,9 @@ async function loadVoices() {
         b.disabled = true; b.textContent = "…";
         try {
           const text = v.voice_lang === "hi" ? "नमस्ते, यह मेरी आवाज़ का एक छोटा सा नमूना है।" : "Hello, this is a short sample of my voice.";
-          const r = await api("/api/tts/speak", { method: "POST", body: { text, voice_id: v.id, language_id: v.voice_lang } });
-          out.innerHTML = ""; const p = playerEl(r); out.appendChild(p); p.querySelector("audio").play().catch(() => {});
-          setUsage(r.usage);
+          const job = await pollJob(await api("/api/tts/speak", { method: "POST", body: { text, voice_id: v.id, language_id: v.voice_lang } }),
+            (j, secs) => { b.textContent = `${secs}s`; });
+          out.innerHTML = ""; const p = playerEl(job.clip); out.appendChild(p); p.querySelector("audio").play().catch(() => {});
         } catch (e) { alert(e.message); } finally { b.disabled = false; b.textContent = "Test"; }
       }));
       if (v.mine) acts.append(btn("Delete", async () => {
@@ -885,8 +885,21 @@ function fillVoiceSelects() {
 async function loadAudioLib() {
   const box = $("#audioLib");
   try {
-    const r = await api("/api/audio-history"); box.innerHTML = "";
-    if (!r.items.length) { box.innerHTML = '<div class="hint">Nothing yet.</div>'; return; }
+    const [r, jobs] = await Promise.all([api("/api/audio-history"), api("/api/tts/jobs").catch(() => ({ jobs: [] }))]);
+    box.innerHTML = "";
+    const active = jobs.jobs.filter(j => ["queued", "running"].includes(j.status));
+    active.forEach(j => {
+      const row = document.createElement("div"); row.className = "vrow";
+      const t = document.createElement("div"); t.className = "hint";
+      t.textContent = `In progress · part ${Math.min(j.parts_done + 1, j.parts_total)} of ${j.parts_total} · ${j.text_preview.slice(0, 60)}`;
+      row.append(t, btn("Cancel", async () => { await api(`/api/tts/jobs/${j.id}`, { method: "DELETE" }).catch(() => {}); loadAudioLib(); }));
+      box.appendChild(row);
+    });
+    jobs.jobs.filter(j => j.status === "error" && Date.now() / 1000 - j.created_at < 86400).slice(0, 3).forEach(j => {
+      const e = document.createElement("div"); e.className = "msg err"; e.textContent = `Failed: ${j.error} · ${j.text_preview.slice(0, 50)}`; box.appendChild(e);
+    });
+    if (active.length) setTimeout(() => { if (!$("#tab-voice").classList.contains("hidden")) loadAudioLib(); }, 4000);
+    if (!r.items.length && !active.length) { box.insertAdjacentHTML("beforeend", '<div class="hint">Nothing yet.</div>'); return; }
     r.items.forEach(c => {
       const wrap = document.createElement("div"); wrap.style.marginBottom = "10px";
       const t = document.createElement("div"); t.className = "hint";
@@ -944,30 +957,59 @@ async function openListen(ctx) {
   $("#listenModal").classList.remove("hidden");
 }
 
+async function pollJob(job, onProgress) {
+  const t0 = Date.now();
+  for (;;) {
+    onProgress && onProgress(job, Math.round((Date.now() - t0) / 1000));
+    if (["done", "error", "cancelled"].includes(job.status)) break;
+    await new Promise(r => setTimeout(r, 2500));
+    try { job = await api(`/api/tts/jobs/${job.id}`); } catch (e) { if (/sign in/i.test(e.message)) throw e; }
+  }
+  if (job.usage) setUsage(job.usage);
+  if (job.status === "error") throw new Error(job.error || "Audio job failed");
+  if (job.status === "cancelled") throw new Error("Cancelled");
+  return job;
+}
+function jobLabel(job, secs) {
+  const asleep = secs < 75 && job.parts_done === 0 ? " · waking the voice GPU (~40–60s)" : "";
+  return job.parts_total > 1
+    ? `Rendering part ${Math.min(job.parts_done + 1, job.parts_total)} of ${job.parts_total} · ${secs}s${asleep}. You can close this; it keeps going.`
+    : `Rendering audio · ${secs}s${asleep}`;
+}
+V.activeJob = null;
+
 function lBusy(on, label) {
   ["#lSpeak", "#lSplit", "#lRenderScene"].forEach(id => $(id).disabled = on);
   if (!on) return null;
   const t0 = Date.now(); const tick = () => { $("#lMsg").className = "msg"; $("#lMsg").textContent = `${label} ${Math.round((Date.now() - t0) / 1000)}s`; };
   tick(); return setInterval(tick, 1000);
 }
-function lDone(r) {
-  $("#lMsg").className = "msg ok"; $("#lMsg").textContent = `Ready · ${fmtDur(r.duration_sec)}${r.cold_start ? " (voice worker was asleep)" : ""} · saved to Voice › Saved audio`;
+function lDone(job) {
+  const r = job.clip;
+  $("#lMsg").className = "msg ok"; $("#lMsg").textContent = `Ready · ${fmtDur(r.duration_sec)}${job.parts_total > 1 ? ` · ${job.parts_total} parts joined` : ""} · saved to Voice › Saved audio`;
   const p = playerEl(r); $("#lResult").innerHTML = ""; $("#lResult").appendChild(p); p.querySelector("audio").play().catch(() => {});
-  setUsage(r.usage);
-  if (r.message_id) { (V.byMsg[r.message_id] ||= []).push(r); renderThread(); }
+  if (r.message_id && W.tid && r.thread_id === W.tid) { (V.byMsg[r.message_id] ||= []).push(r); renderThread(); }
+}
+async function runListenJob(path, body) {
+  ["#lSpeak", "#lSplit", "#lRenderScene"].forEach(id => $(id).disabled = true);
+  $("#lMsg").className = "msg"; $("#lMsg").textContent = "Starting…";
+  const cancel = btn("Cancel", async () => { if (V.activeJob) await api(`/api/tts/jobs/${V.activeJob}`, { method: "DELETE" }).catch(() => {}); });
+  $("#lResult").innerHTML = ""; $("#lResult").appendChild(cancel);
+  try {
+    const started = await api(path, { method: "POST", body });
+    V.activeJob = started.id;
+    const job = await pollJob(started, (j, secs) => { $("#lMsg").className = "msg"; $("#lMsg").textContent = jobLabel(j, secs); });
+    lDone(job);
+  } catch (e) { $("#lMsg").className = "msg err"; $("#lMsg").textContent = e.message; cancel.remove(); }
+  finally { V.activeJob = null; ["#lSpeak", "#lSplit", "#lRenderScene"].forEach(id => $(id).disabled = false); }
 }
 
 $("#lSpeak").addEventListener("click", async () => {
   const text = $("#lText").value.trim(); if (!text) return;
-  const timer = lBusy(true, "Generating voice on Modal T4… (~40–60s if asleep)");
-  try {
-    const r = await api("/api/tts/speak", { method: "POST", body: {
-      text, voice_id: $("#lVoice").value, language_id: $("#lLang").value, exaggeration: +$("#lExg").value,
-      cfg_weight: +$("#lCfg").value, convert_hinglish: $("#lLang").value === "hi" && $("#lHinglish").checked,
-      thread_id: V.ctx.thread_id || null, message_id: V.ctx.message_id || null } });
-    lDone(r);
-  } catch (e) { $("#lMsg").className = "msg err"; $("#lMsg").textContent = e.message; }
-  finally { clearInterval(timer); lBusy(false); }
+  await runListenJob("/api/tts/speak", {
+    text, voice_id: $("#lVoice").value, language_id: $("#lLang").value, exaggeration: +$("#lExg").value,
+    cfg_weight: +$("#lCfg").value, convert_hinglish: $("#lLang").value === "hi" && $("#lHinglish").checked,
+    thread_id: V.ctx.thread_id || null, message_id: V.ctx.message_id || null });
 });
 
 function renderTurns() {
@@ -1000,13 +1042,8 @@ $("#lRenderScene").addEventListener("click", async () => {
   const turns = V.turns.filter(t => t.text.trim()).map(t => ({ slot: t.slot, speaker_name: t.speaker_name || "", text: t.text.trim(), preset: t.preset || null }));
   if (!turns.length) return;
   const voice_map = { A: $("#lVA").value, B: $("#lVB").value }; if ($("#lVN").value) voice_map.narrator = $("#lVN").value;
-  const timer = lBusy(true, "Generating multi-voice scene on Modal T4…");
-  try {
-    const r = await api("/api/tts/dialogue", { method: "POST", body: {
-      language_id: $("#lLang").value, voice_map, turns, thread_id: V.ctx.thread_id || null, message_id: V.ctx.message_id || null } });
-    lDone(r);
-  } catch (e) { $("#lMsg").className = "msg err"; $("#lMsg").textContent = e.message; }
-  finally { clearInterval(timer); lBusy(false); }
+  await runListenJob("/api/tts/dialogue", {
+    language_id: $("#lLang").value, voice_map, turns, thread_id: V.ctx.thread_id || null, message_id: V.ctx.message_id || null });
 });
 
 // ---- boot
