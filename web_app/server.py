@@ -65,6 +65,12 @@ class Settings:
         if self.llm_default_model and self.llm_default_model not in [m["id"] for m in self.llm_models]:
             self.llm_models.insert(0, {"label": "Default", "id": self.llm_default_model})
         self.enhancer_model = env("ENHANCER_MODEL", "") or self.llm_default_model
+        # helper tasks (transliteration, scene splitting, prompts) try these in order
+        self.utility_models = list(dict.fromkeys(
+            [m for m in [env("UTILITY_MODEL", ""), *[x["id"] for x in self.llm_models
+                                                   if "deepseek" in x["id"].lower()], self.llm_default_model,
+                         *[x["id"] for x in self.llm_models]] if m]
+        ))
         self.local_prompts_path = Path(env("WRITER_PROMPTS_FILE", str(BASE_DIR / "prompts.local.json")))
         self.cookie_secure = env("COOKIE_SECURE", "1") != "0"
         self.monthly_cap_min = float(env("MONTHLY_GPU_MINUTES_CAP", "1800"))
@@ -411,12 +417,12 @@ def create_app(
         text = rule_text
         if settings.llm_enabled:
             try:
-                llm_text, usage_info = await llm.complete(
+                llm_text, usage_info, used = await llm.complete_any(
                     [{"role": "system", "content": prompt_tools.ENHANCER_SYSTEM_PROMPT},
                      {"role": "user", "content": body.prompt}],
-                    model=settings.enhancer_model, temperature=0.4, max_tokens=400,
+                    models=[settings.enhancer_model, *settings.utility_models], temperature=0.4, max_tokens=400,
                 )
-                wstore.log_usage(user, "enhance", settings.enhancer_model, usage_info, body.prompt, llm_text)
+                wstore.log_usage(user, "enhance", used, usage_info, body.prompt, llm_text)
                 cleaned, more = prompt_tools.strip_negations(prompt_tools.scrub_terms(llm_text.strip().strip('"')))
                 if len(cleaned.split()) >= 30 and not prompt_tools.blocked_reason(cleaned):
                     text, source = cleaned, "llm"

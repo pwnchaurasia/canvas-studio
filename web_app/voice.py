@@ -342,11 +342,11 @@ def build_router(
     async def to_devanagari(user: str, text: str) -> str:
         if not settings.llm_enabled:
             return text
-        out, usage_info = await llm.complete(
+        out, usage_info, used = await llm.complete_any(
             [{"role": "system", "content": TRANSLIT_PROMPT}, {"role": "user", "content": text}],
-            model=settings.llm_default_model, temperature=0.2, max_tokens=min(8000, len(text) * 2 + 200),
+            models=settings.utility_models, temperature=0.2, max_tokens=min(8000, len(text) * 2 + 200),
         )
-        wstore.log_usage(user, "transliterate", settings.llm_default_model, usage_info, text, out)
+        wstore.log_usage(user, "transliterate", used, usage_info, text, out)
         return out.strip() or text
 
     # ---- voice bank (shared between the family accounts)
@@ -551,12 +551,12 @@ def build_router(
             "verbatim, keeping tone and English loanwords." if body.language_id == "hi" and body.convert_hinglish
             else "Keep each line in its original language and script."
         )
-        raw, usage_info = await llm.complete(
+        raw, usage_info, used = await llm.complete_any(
             [{"role": "system", "content": PARSE_PROMPT.format(narrator_rule=narrator_rule, language_rule=language_rule)},
              {"role": "user", "content": body.text}],
-            model=settings.llm_default_model, temperature=0.2, max_tokens=8000,
+            models=settings.utility_models, temperature=0.2, max_tokens=8000,
         )
-        wstore.log_usage(user, "parse", settings.llm_default_model, usage_info, body.text, raw)
+        wstore.log_usage(user, "parse", used, usage_info, body.text, raw)
         try:
             data = extract_json(raw)
         except ValueError:

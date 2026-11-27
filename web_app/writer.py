@@ -178,6 +178,27 @@ class LLMClient:
             raise HTTPException(status_code=502, detail="Writer model returned an unexpected response") from e
         return _THINK.sub("", text).strip(), j.get("usage") or {}
 
+    async def complete_any(
+        self, messages: list[dict], models: list[str], temperature: float, max_tokens: int
+    ) -> tuple[str, dict, str]:
+        """Try each model in order (one retry each) until one answers. Returns (text, usage, model_used).
+        Used for short helper tasks where any capable model will do."""
+        import asyncio
+
+        last: HTTPException | None = None
+        for model in dict.fromkeys(m for m in models if m):
+            for attempt in (1, 2):
+                try:
+                    text, usage = await self.complete(messages, model, temperature, max_tokens)
+                    if text.strip():
+                        return text, usage, model
+                    last = HTTPException(status_code=502, detail=f"{model} returned an empty reply")
+                except HTTPException as e:
+                    last = e
+                    if attempt == 1:
+                        await asyncio.sleep(2)
+        raise last or HTTPException(status_code=502, detail="No writer model available")
+
     async def stream(
         self, messages: list[dict], model: str, temperature: float, max_tokens: int
     ) -> AsyncIterator[tuple[str, Any]]:
@@ -604,12 +625,12 @@ def build_router(
         thread = wstore.get_thread(user, thread_id)
         bible = thread["story_bible"].strip() or "(none provided)"
         model = thread["model_id"] or settings.llm_default_model
-        text, usage_info = await llm.complete(
+        text, usage_info, used = await llm.complete_any(
             [{"role": "system", "content": SCENE_SYSTEM_PROMPT},
              {"role": "user", "content": f"STORY BIBLE:\n{bible}\n\nSCENE:\n{body.scene_text[:12000]}"}],
-            model=model, temperature=0.4, max_tokens=600,
+            models=[model, *settings.utility_models], temperature=0.4, max_tokens=600,
         )
-        wstore.log_usage(user, "scene", model, usage_info, body.scene_text, text)
+        wstore.log_usage(user, "scene", used, usage_info, body.scene_text, text)
         cleaned = re.sub(r"\bbarely\b\s*", "", text.strip().strip('"'), flags=re.IGNORECASE)
         cleaned, _ = prompt_tools.strip_negations(prompt_tools.scrub_terms(cleaned))
         words = cleaned.split()

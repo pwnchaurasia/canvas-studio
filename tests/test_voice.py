@@ -252,18 +252,37 @@ def test_long_dialogue_grouped(vclient, tts):
     assert calls[0]["lead_silence_ms"] == 0 and calls[1]["lead_silence_ms"] == 400
 
 
-def test_failed_part_marks_job_error(vclient, tts):
+def test_failed_part_marks_job_error(vclient, tts, monkeypatch):
     c = vclient("alice", "pw-a")
     vid = upload(c).json()["id"]
-    orig = tts.__call__
+    orig = FakeTTS.__call__
 
-    def failing(request):
+    def failing(self, request):
         if request.url.path == "/synthesize":
             return httpx.Response(503, json={"detail": "worker busy"})
-        return orig(request)
-    tts.__class__.__call__ = lambda self, req: failing(req)
-    try:
-        job = wait(c, c.post("/api/tts/speak", json={"text": "Hello.", "voice_id": vid}, headers=HEADERS))
-    finally:
-        tts.__class__.__call__ = FakeTTS.__dict__["__call__"] if "__call__" in FakeTTS.__dict__ else orig
+        return orig(self, request)
+    monkeypatch.setattr(FakeTTS, "__call__", failing)
+    job = wait(c, c.post("/api/tts/speak", json={"text": "Hello.", "voice_id": vid}, headers=HEADERS))
     assert job["status"] == "error" and "worker busy" in job["error"]
+
+
+def test_helper_tasks_fall_back_to_next_model(vclient, tts, llm, monkeypatch):
+    c = vclient("alice", "pw-a")
+    vid = upload(c).json()["id"]
+    seen = []
+    orig = FakeLLM.__call__
+
+    def flaky(self, request):
+        model = json.loads(request.content)["model"]
+        seen.append(model)
+        if model == "model-a":
+            return httpx.Response(503, json={"error": {"message": "Service temporarily unavailable"}})
+        return orig(self, request)
+    monkeypatch.setattr(FakeLLM, "__call__", flaky)
+    monkeypatch.setattr(server.Settings, "llm_enabled", property(lambda s: True))
+    app_settings = c.app.state.settings
+    app_settings.utility_models = ["model-a", "model-b"]
+    llm.completion = "तुम कब आए?"
+    job = wait(c, c.post("/api/tts/speak", json={"text": "Tum kab aaye?", "voice_id": vid, "language_id": "hi"}, headers=HEADERS))
+    assert job["status"] == "done" and job["spoken_text"] == "तुम कब आए?", job
+    assert seen[:3] == ["model-a", "model-a", "model-b"]
