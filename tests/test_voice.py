@@ -64,7 +64,8 @@ def vclient(env, renderer, llm, tts, monkeypatch):
 def wait(c, r):
     assert r.status_code == 200, r.text
     job = r.json()
-    for _ in range(200):
+    deadline = time.monotonic() + 20  # wall-clock budget, independent of how fast the machine polls
+    while time.monotonic() < deadline:
         job = c.get(f"/api/tts/jobs/{job['id']}").json()
         if job["status"] in ("done", "error", "cancelled"):
             return job
@@ -262,6 +263,7 @@ def test_failed_part_marks_job_error(vclient, tts, monkeypatch):
             return httpx.Response(503, json={"detail": "worker busy"})
         return orig(self, request)
     monkeypatch.setattr(FakeTTS, "__call__", failing)
+    monkeypatch.setattr(voice, "PART_RETRY_DELAY_S", 0.0)
     job = wait(c, c.post("/api/tts/speak", json={"text": "Hello.", "voice_id": vid}, headers=HEADERS))
     assert job["status"] == "error" and "worker busy" in job["error"]
 

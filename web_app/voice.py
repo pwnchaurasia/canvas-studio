@@ -28,6 +28,7 @@ ALLOWED_EXT = {".wav", ".mp3", ".m4a"}
 MAX_SPEAK_CHARS = 30000          # ~5,000 words; long text is rendered as a background job in parts
 PART_CHARS = 1200                # ~90 s of speech per worker request, far below any proxy timeout
 PART_TURNS = 10
+PART_RETRY_DELAY_S = 5.0        # pause before the single retry of a failed part
 AUDIO_RE = re.compile(r"^([a-z0-9-]{1,32})_(\d{10,16})_([a-f0-9]{6})(_dlg)?\.mp3$")
 VOICE_ID_RE = re.compile(r"^[a-z0-9_-]{1,48}$")
 
@@ -454,7 +455,7 @@ def build_router(
                         except HTTPException:
                             if attempt == 2:
                                 raise
-                            await asyncio.sleep(5)
+                            await asyncio.sleep(PART_RETRY_DELAY_S)
                     audio.append(r.content)
                     duration += float(r.headers.get("X-Audio-Duration") or 0)
                     gen_s += float(r.headers.get("X-Gen-Seconds") or 0)
